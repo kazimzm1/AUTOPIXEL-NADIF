@@ -8,6 +8,9 @@ Commands:
   /check_offer  – Run Google One automation and look for Gemini Pro offer
   /get_link     – Show the last captured offer link
   /status       – Show current session status and device profile
+  /disable_proxy – Force the current session to use direct/local IP
+  /lang_id      – Switch chat language to Indonesian
+  /langid       – Alias for /lang_id
 
 Supports both Gmail (user@gmail.com) and Google Workspace (user@company.com)
 accounts.
@@ -20,6 +23,7 @@ import sys
 from telegram import Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ConversationHandler,
     MessageHandler,
@@ -27,14 +31,18 @@ from telegram.ext import (
 )
 
 import config
-from handlers.bot_handlers import (
+from handlers import (
     AWAIT_2FA_CODE,
     AWAIT_EMAIL,
+    AWAIT_MANUAL_VERIFICATION,
     AWAIT_PASSWORD,
     cancel_2fa,
     check_offer,
+    disable_proxy,
     get_link,
     handle_2fa_code,
+    handle_manual_verification,
+    ip_status,
     lang_en,
     lang_id,
     login_cancel,
@@ -43,10 +51,13 @@ from handlers.bot_handlers import (
     login_start,
     logout,
     offer_timeout,
+    proxy_status,
+    rotate_proxy,
     session_cleanup_job,
     start,
     status,
 )
+from handlers.ui import button_regex
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 from datetime import datetime as _dt
@@ -91,7 +102,11 @@ def main() -> None:
 
     # /login conversation
     login_conv = ConversationHandler(
-        entry_points=[CommandHandler("login", login_start)],
+        entry_points=[
+            CommandHandler("login", login_start),
+            CallbackQueryHandler(login_start, pattern=r"^menu:login$"),
+            MessageHandler(filters.Regex(button_regex("menu_login")), login_start),
+        ],
         states={
             AWAIT_EMAIL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, login_email)
@@ -105,10 +120,20 @@ def main() -> None:
     )
 
     offer_conv = ConversationHandler(
-        entry_points=[CommandHandler("check_offer", check_offer)],
+        entry_points=[
+            CommandHandler("check_offer", check_offer),
+            CallbackQueryHandler(check_offer, pattern=r"^menu:check_offer$"),
+            MessageHandler(filters.Regex(button_regex("menu_check_offer")), check_offer),
+        ],
         states={
             AWAIT_2FA_CODE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_2fa_code)
+            ],
+            AWAIT_MANUAL_VERIFICATION: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    handle_manual_verification,
+                )
             ],
             ConversationHandler.TIMEOUT: [
                 MessageHandler(filters.ALL, offer_timeout)
@@ -116,17 +141,42 @@ def main() -> None:
         },
         fallbacks=[CommandHandler("cancel", cancel_2fa)],
         allow_reentry=True,
-        conversation_timeout=120,  # 2 minutes to enter 2FA code
+        conversation_timeout=300,  # 5 minutes for TOTP or manual verification
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(start, pattern=r"^menu:home$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_home")), start))
     app.add_handler(CommandHandler("lang_en", lang_en))
+    app.add_handler(CallbackQueryHandler(lang_en, pattern=r"^menu:lang_en$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_lang_en")), lang_en))
     app.add_handler(CommandHandler("lang_id", lang_id))
+    app.add_handler(CommandHandler("langid", lang_id))
+    app.add_handler(CallbackQueryHandler(lang_id, pattern=r"^menu:lang_id$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_lang_id")), lang_id))
     app.add_handler(login_conv)
     app.add_handler(CommandHandler("logout", logout))
+    app.add_handler(CallbackQueryHandler(logout, pattern=r"^menu:logout$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_logout")), logout))
     app.add_handler(offer_conv)
     app.add_handler(CommandHandler("get_link", get_link))
+    app.add_handler(CallbackQueryHandler(get_link, pattern=r"^menu:get_link$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_get_link")), get_link))
+    app.add_handler(CommandHandler("ip", ip_status))
+    app.add_handler(CallbackQueryHandler(ip_status, pattern=r"^menu:ip$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_ip")), ip_status))
+    app.add_handler(CommandHandler("proxy", proxy_status))
+    app.add_handler(CallbackQueryHandler(proxy_status, pattern=r"^menu:proxy$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_proxy")), proxy_status))
+    app.add_handler(CommandHandler("rotate_proxy", rotate_proxy))
+    app.add_handler(CallbackQueryHandler(rotate_proxy, pattern=r"^menu:rotate_proxy$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_rotate_proxy")), rotate_proxy))
+    app.add_handler(CommandHandler("disable_proxy", disable_proxy))
+    app.add_handler(CallbackQueryHandler(disable_proxy, pattern=r"^menu:disable_proxy$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_disable_proxy")), disable_proxy))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CallbackQueryHandler(status, pattern=r"^menu:status$"))
+    app.add_handler(MessageHandler(filters.Regex(button_regex("menu_status")), status))
 
     # Periodic job: purge expired sessions every 5 minutes
     app.job_queue.run_repeating(

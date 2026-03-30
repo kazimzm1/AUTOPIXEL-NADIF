@@ -1,302 +1,260 @@
 # AutoPixel
 
-**Pixel 10 Pro Google One Offer Automation Bot (Telegram)**
+**Pixel 10 Pro Google One Assistant**  
+Created by **Nadif Rizky**
 
-AutoPixel is a production-ready Telegram automation bot that simulates a
-Pixel 10 Pro (Android 16), signs in with a user-provided Google account,
-and checks whether the account is eligible for the
-**12-month Gemini Pro promotional offer** from Google One.
+AutoPixel is a Telegram bot that simulates a Pixel 10 Pro session, signs in to a Google account, checks Google One / Gemini offer availability, and gives you a modern control panel for session, proxy, IP, and diagnostic tools.
 
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-1f6feb)
-![Runtime](https://img.shields.io/badge/runtime-Python%203.10%2B-3776AB)
-![Container](https://img.shields.io/badge/container-Docker-2496ED)
-![Architecture](https://img.shields.io/badge/architecture-modular-2ea043)
+## What This Bot Does
 
-### Highlights
+- Simulates a fresh Pixel 10 Pro device profile for each login session
+- Supports Gmail and Google Workspace accounts
+- Handles Google sign-in with TOTP / authenticator flow support
+- Checks Google One pages for Gemini / AI Pro offer availability
+- Supports proxy pool rotation and direct/local IP mode
+- Shows public IP, region, ZIP, org, ISP, ASN, timezone, and other proxy identity details
+- Saves screenshot + HTML debug artifacts when no offer is found
+- Supports English and Indonesian UI
+- Ships with a modern Telegram dashboard:
+  - header media
+  - 2-column grid buttons
+  - `[·]` section cards
+  - emoji-rich menu labels
 
-- Modular architecture (core, handlers, services)
-- Secure in-memory credential handling with wipe logic
-- Cross-platform execution (Windows, Linux, macOS)
-- Docker-first deployment for predictable operations
+## Main Commands
 
-### Release Notes
-
-- See [CHANGELOG.md](CHANGELOG.md) for version history and release details.
-
-## At a Glance
-
-| Category | Details |
+| Command | Function |
 |---|---|
-| Primary interface | Telegram bot commands |
-| Main automation target | Google One offer flow |
-| Device simulation | Pixel 10 Pro (Android 16) |
-| Authentication support | Gmail + Google Workspace |
-| 2FA support | Authenticator/TOTP flow |
-| Deployment options | Local Python or Docker Compose |
+| `/start` | Open the Pixel Control Panel |
+| `/login` | Save Google email + password and create a fresh device session |
+| `/check_offer` | Start login automation and scan Google One for an offer |
+| `/get_link` | Show the last captured offer link |
+| `/status` | Show account, proxy, and device session info |
+| `/proxy` | Show the active proxy and proxy pool status |
+| `/ip` | Show public IP and geo/identity data |
+| `/rotate_proxy` | Switch to another proxy from the pool |
+| `/disable_proxy` | Force the session to use direct/local IP |
+| `/lang_en` | Switch bot UI to English |
+| `/lang_id` | Switch bot UI to Indonesian |
+| `/langid` | Alias for `/lang_id` |
+| `/logout` | Clear active session, credentials, and temporary browser state |
+| `/cancel` | Cancel the current login / verification flow |
 
----
+## Current UI
+
+The bot now uses:
+
+- a modern welcome card
+- a local banner/header image on `/start`
+- a 2-column inline control panel
+- reply-keyboard navigation buttons
+- branded text showing **Created by Nadif Rizky**
+
+Important: old inline panels sent before the latest update still contain the old non-working inline-query buttons. Send `/start` again to get the new working control panel.
 
 ## Project Structure
 
-```
-autopixel/
-├── main.py               # Telegram bot entry point
+```text
+AUTOPIXEL/
+├── main.py
+├── config.py
+├── requirements.txt
+├── README.md
 ├── core/
-│   ├── __init__.py
-│   ├── runtime_state.py      # Shared rate-limit + concurrency state
-│   └── session_manager.py    # Session lifecycle and secure wipe helpers
+│   ├── proxy_manager.py
+│   └── session_manager.py
 ├── handlers/
-│   ├── __init__.py
-│   ├── bot_handlers.py        # Compatibility facade exports
-│   ├── auth_handlers.py       # /start /login /logout flows
-│   ├── offer_handlers.py      # /check_offer + 2FA flows
-│   ├── session_handlers.py    # /status /get_link + cleanup job
-│   └── states.py              # Conversation state constants
+│   ├── auth_handlers.py
+│   ├── offer_handlers.py
+│   ├── session_handlers.py
+│   └── ui.py
 ├── services/
-│   ├── __init__.py
-│   ├── device_simulator.py   # Public device simulator facade
-│   ├── device_simulator_core/
-│   │   ├── __init__.py
-│   │   ├── constants.py      # Pixel hardware/emulation constants
-│   │   ├── generators.py     # IMEI/Android ID/fingerprint helpers
-│   │   ├── profile.py        # DeviceProfile model + spoof payloads
-│   │   └── factory.py        # create_device_profile factory
-│   ├── google_automation.py  # Public automation facade
-│   └── google_automation_core/
-│       ├── __init__.py
-│       ├── api.py            # Public callable service functions
-│       ├── errors.py         # Domain exceptions
-│       ├── driver_factory.py # WebDriver + emulation setup
-│       ├── login_flow.py     # Google login + TOTP flow
-│       └── offer_scanner.py  # Offer detection and link extraction
-├── config.py             # Configuration and constants
-├── Dockerfile            # Docker image definition
-├── docker-compose.yml    # Docker Compose orchestration
-├── requirements.txt      # Python dependencies
-└── README.md             # This file
+│   ├── device_simulator.py
+│   ├── google_automation.py
+│   └── network_diagnostics.py
+└── assets/
+    └── telegram/
+        └── pixel-header.png
 ```
-
----
-
-## Features
-
-| Feature | Details |
-|---|---|
-| Device simulation | Pixel 10 Pro profile with unique IMEI, Android ID, and user-agent per session |
-| Telegram UX | Command-based flow with modern reply keyboards and quick actions |
-| Authentication | Selenium-powered Google sign-in (Gmail + Workspace) |
-| Offer detection | Multi-attempt Google One scanning with retry strategy |
-| Session lifecycle | In-memory per-user sessions with secure credential wiping |
-| Safety controls | Cooldown, concurrency limit, and structured error handling |
-
----
-
-## Supported Regions (Pixel 10 Series Offer)
-
-This regional matrix applies to all three models:
-**Pixel 10 Pro**, **Pixel 10 Pro XL**, and **Pixel 10 Pro Fold**.
-
-| Coverage Metric | Value |
-|---|---|
-| Supported devices | Pixel 10 Pro / Pixel 10 Pro XL / Pixel 10 Pro Fold |
-| Total supported regions | 33 |
-| Regional status | ✅ Officially supported |
-
-| Americas | Europe | APAC |
-|---|---|---|
-| Canada<br>Mexico<br>United States | Austria<br>Belgium<br>Czech Republic<br>Denmark<br>Estonia<br>Finland<br>France<br>Germany<br>Hungary<br>Ireland<br>Italy<br>Latvia<br>Lithuania<br>Netherlands<br>Norway<br>Poland<br>Portugal<br>Romania<br>Slovakia<br>Slovenia<br>Spain<br>Sweden<br>Switzerland<br>United Kingdom | Australia<br>India<br>Japan<br>Malaysia<br>Singapore<br>Taiwan |
-
-> Note: Offer availability can still vary by account eligibility, subscription history, and Google policy checks.
-
----
-
-## Eligibility Checklist
-
-Before running `/check_offer`, validate this checklist to improve success rate:
-
-| Check | Why it matters | Recommended action |
-|---|---|---|
-| Region eligibility | Offer is region-limited | Confirm account and IP region are in supported regions |
-| Account offer history | Prior claim can block new claim | Use an account that has not redeemed the same promo |
-| Active subscriptions | Existing Gemini/Google One plans may disqualify | Review and verify subscription status in Google account |
-| Family group state | Family eligibility can be consumed by another member | Check Google family group plan/benefit state |
-| 2FA method | Unsupported challenges interrupt automation | Prefer TOTP/Auth app for automated flow |
-| Login security posture | New or high-risk sessions trigger challenges | Use a stable device/IP and avoid rapid account switching |
-
----
-
-## Troubleshooting by Symptom
-
-| Symptom | Likely cause | Next step |
-|---|---|---|
-| `No credentials found` | Session not initialized | Run `/login` and submit account details again |
-| `Automation Error: Chromium is not installed` | Browser path not available | Install Chrome/Chromium or set `CHROME_BIN` |
-| `Code rejected` during 2FA | Invalid/expired TOTP code | Re-check TOTP secret and sync system time |
-| `No Gemini Pro offer found after 3 attempts` | Account/region not eligible or offer already consumed | Verify eligibility checklist and test another account |
-| Repeated challenge prompts | Account risk controls or unusual login signals | Keep region/IP stable and reduce aggressive retries |
-| Bot starts but does not respond | Token/webhook/session issue | Verify `TELEGRAM_BOT_TOKEN`, restart bot, review logs |
-
-> Tip: If manual browser check also shows no offer for the same account, bot automation will not be able to force eligibility.
-
----
-
-## Quick Start (Local)
-
-```bash
-# 1) Create virtual environment
-python -m venv .venv
-
-# 2) Activate environment
-# Linux/macOS
-source .venv/bin/activate
-# Windows PowerShell
-.venv\Scripts\Activate.ps1
-
-# 3) Install dependencies
-pip install -r requirements.txt
-
-# 4) Configure environment
-cp .env.example .env
-# Set TELEGRAM_BOT_TOKEN in .env
-
-# 5) Run bot
-python main.py
-```
-
----
-
-## Deployment (Ubuntu + Docker)
-
-### Prerequisites
-
-- Ubuntu 24.04 64-bit server
-- Docker and Docker Compose installed
-
-### 1. Install Docker
-
-```bash
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-# Log out and back in for group change to take effect
-```
-
-### 2. Create a Telegram Bot
-
-1. Open Telegram and search for **@BotFather**.
-2. Send `/newbot` and follow the prompts.
-3. Copy the API token you receive (looks like `123456:ABC-DEF…`).
-
-### 3. Clone and configure
-
-```bash
-git clone https://github.com/imnoob59/autopixel.git autopixel
-cd autopixel
-
-# Create environment file
-cp .env.example .env
-nano .env
-# Set TELEGRAM_BOT_TOKEN=<your token from BotFather>
-```
-
-### 4. Build and run
-
-```bash
-docker compose up -d --build
-```
-
-### 5. Management commands
-
-```bash
-# Stop bot
-docker compose stop
-
-# Stop and remove containers
-docker compose down
-
-# Restart
-docker compose restart
-
-# Rebuild after code updates
-docker compose up -d --build
-
-# View live logs (console)
-docker compose logs -f
-
-# View log file
-cat logs/bot.log
-
-# View last 100 log lines
-tail -n 100 logs/bot.log
-
-# View container status
-docker compose ps
-
-# Check the main container directly
-docker ps --filter "name=autpixel"
-```
-
-> **Note**: The container uses the `restart: on-failure:3` policy and will
-> auto-restart only on failure (up to 3 times).
-> Manual `docker compose stop` or `docker compose down` will not trigger restart.
-
----
-
-## Usage
-
-| Command | Description |
-|---|---|
-| `/start` | Show welcome message and command list |
-| `/login` | Enter Gmail email and password (two-step conversation) |
-| `/check_offer` | Simulate device, log in, and search for the Gemini Pro offer |
-| `/get_link` | Retrieve the last captured offer link |
-| `/status` | View current session info and device profile |
-| `/logout` | Securely clear credentials and session data |
-
-### Typical flow
-
-```
-You: /start
-Bot: Welcome…
-
-You: /login
-Bot: Please enter your Gmail address:
-
-You: user@gmail.com
-Bot: Email received. Now enter your password:
-
-You: ••••••••
-Bot: ✅ Credentials saved. New Pixel 10 Pro device profile created…
-
-You: /check_offer
-Bot: ⏳ Launching device simulator…
-Bot: 🎉 Gemini Pro Offer Found! 🔗 https://one.google.com/…
-```
-
----
-
-## Technical Notes
-
-- **Headless Chrome** is used via Selenium with mobile emulation matching
-  the Pixel 10 Pro screen dimensions (390 × 844, pixel ratio 3.0).
-- A new **IMEI**, **Android ID**, and **Chrome version patch** are generated
-  for every session using the `device_simulator.py` module.
-- Credentials are stored as **`bytearray`** objects for secure in-place
-  memory erasure. Passwords are wiped after use and never written to disk.
-- **Rate limiting**: 5-minute cooldown per user between `/check_offer` calls.
-- **Concurrency control**: Maximum 3 simultaneous Chrome instances.
-- Session **TTL** of 30 minutes with automatic cleanup.
-
----
 
 ## Requirements
 
-- Docker (recommended) or Python 3.10+ with Chromium and chromedriver
-- A Telegram Bot token from @BotFather
+- Python 3.10+
+- Google Chrome installed
+- A Telegram bot token from `@BotFather`
+- Internet connection
+- Optional: `proxies.txt` if you want proxy mode
 
----
+## Local Setup
+
+### 1. Create and activate virtualenv
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+### 2. Install dependencies
+
+```powershell
+pip install -r requirements.txt
+```
+
+### 3. Configure environment
+
+Copy `.env.example` to `.env` and fill what you need:
+
+```env
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+BOT_HEADER_MEDIA_URL=
+CHROME_BIN=
+CHROMEDRIVER_PATH=
+PROXY_ENABLED=1
+PROXY_FILE_PATH=
+PROXY_FAILURE_COOLDOWN_SECONDS=90
+PROXY_QUARANTINE_SECONDS=300
+PROXY_QUARANTINE_THRESHOLD=3
+```
+
+Notes:
+
+- `BOT_HEADER_MEDIA_URL` supports a local image path, image URL, GIF URL, or MP4 URL
+- if `BOT_HEADER_MEDIA_URL` is empty, the bot uses the bundled local banner asset
+- if `CHROMEDRIVER_PATH` is empty, Selenium Manager fallback is used
+
+### 4. Optional: add proxies
+
+Create `proxies.txt` in the project root if you want proxy mode.
+
+Supported formats:
+
+```text
+http://ip:port
+http://user:pass@ip:port
+https://user:pass@ip:port
+socks5://ip:port
+ip:port:user:pass
+user:pass@ip:port
+```
+
+### 5. Run the bot
+
+```powershell
+python main.py
+```
+
+## Typical Flow
+
+1. Send `/start`
+2. Send `/lang_id` if you want Indonesian UI
+3. Send `/login`
+4. Enter email
+5. Enter password, or `password|totp_secret`
+6. Check `/ip` or `/proxy`
+7. Send `/check_offer`
+8. If 2FA is requested, send the 6-digit code in Telegram
+9. Review the result or debug artifacts
+
+## Success Example
+
+This is a simple example so users can recognize a normal successful flow:
+
+```text
+You: /start
+Bot: Pixel Control Panel opens
+
+You: /login
+Bot: Please enter your Google email address
+
+You: user@gmail.com
+Bot: Email accepted. Now send your password
+
+You: yourpassword
+Bot: ✅ Session Ready
+Bot: A fresh Pixel 10 Pro profile is ready for this session
+
+You: /check_offer
+Bot: ⏳ Starting secure check...
+Bot: 🌍 Active Proxy Panel ...
+Bot: ✅ Login successful
+Bot: 🎉 Gemini Pro Offer Found! 🔗 https://one.google.com/...
+```
+
+## How Users Know It Worked
+
+- Login step is successful when the bot shows `✅ Session Ready`
+- Proxy/direct check is successful when `/ip` or `/proxy` shows the active network identity
+- Offer check is successful when the bot shows `🎉 Gemini Pro Offer Found!`
+- If no offer exists, the bot will say no active offer was found and may attach screenshot/HTML debug artifacts
+
+## Proxy and IP Notes
+
+- `/proxy` shows the active proxy for the session and pool availability
+- `/ip` shows the effective network identity
+- `/disable_proxy` locks the session to direct/local IP
+- `/rotate_proxy` re-enables proxy mode for the session and chooses another proxy
+- when proxy transport fails, `/check_offer` can rotate automatically
+
+## Debug Artifacts
+
+When no offer is found, the bot can save:
+
+- screenshot `.png`
+- page source `.html`
+
+Artifacts are stored under:
+
+```text
+logs/offer_debug/chat_<chat_id>/
+```
+
+This helps distinguish:
+
+- no eligible promo
+- regular paid Google AI Pro plan only
+- page rendering or scanner mismatch
+
+## BotFather Copy
+
+### Short Description
+
+```text
+Pixel 10 Pro Google One assistant with login automation, proxy tools, IP diagnostics, and Gemini offer checking.
+```
+
+### Description
+
+```text
+This bot helps you manage secure Google One / Gemini offer checks with a modern Pixel-style control panel.
+
+✅ Secure Login: Save a session and launch Google sign-in safely
+✅ Offer Check: Scan Google One pages for Gemini / AI Pro offer availability
+✅ Proxy Tools: Rotate proxy, disable proxy, or inspect IP identity in real time
+✅ Session Status: Review account, device, and connection details instantly
+
+Tap /start to open the Pixel Control Panel.
+
+Created by Nadif Rizky.
+```
+
+## Security Notes
+
+- Credentials are kept in memory for the active session only
+- Passwords are wiped after use in the offer-check flow
+- Sessions expire automatically after the configured TTL
+- Automation may still trigger Google security challenges depending on account risk and region context
+
+## Troubleshooting
+
+| Problem | Likely Cause | Next Step |
+|---|---|---|
+| `No module named 'telegram'` | You ran global Python instead of the project virtualenv | Activate `.venv` and run `python main.py` again |
+| `409 Conflict` | More than one bot instance is running | Stop duplicate `main.py` processes |
+| `/check_offer` says no credentials | Session password already cleared | Run `/login` again |
+| Proxy selected but IP still direct | Session is in direct mode or no proxy assigned | Use `/proxy`, `/ip`, or `/rotate_proxy` |
+| Proxy precheck fails | Bad proxy / blocked route | Rotate proxy or replace proxy pool |
+| No offer found | Account not eligible, wrong billing context, or promo already used | Check account region, payments profile, and offer history |
 
 ## Disclaimer
 
-This project is provided for educational and personal use only.
-Automating Google account access may violate Google's Terms of Service.
-Use responsibly and only with accounts you own.
+Use this project responsibly and only with accounts you own or are authorized to use. Automation against third-party services may be restricted by their policies or terms.

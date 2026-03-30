@@ -33,6 +33,13 @@ def clear_session(chat_id: int) -> None:
     if session is None:
         return
 
+    driver = session.get("_driver")
+    if driver:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
     for key in ("password", "email"):
         val = session.get(key)
         if isinstance(val, bytearray):
