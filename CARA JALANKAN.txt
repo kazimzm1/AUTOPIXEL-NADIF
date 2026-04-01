@@ -1,6 +1,0 @@
-.venv\Scripts\Activate.ps1
-python main.py
-
-
-Atau langsung tanpa activate:
-.venv\Scripts\python.exe main.py

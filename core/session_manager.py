@@ -2,6 +2,7 @@
 
 import logging
 import time
+import uuid
 
 import config
 
@@ -25,6 +26,21 @@ def secure_wipe(data: bytearray) -> None:
     """Zero-fill a bytearray in-place so the original bytes are unrecoverable."""
     for i in range(len(data)):
         data[i] = 0
+
+
+def ensure_proxy_session_token(session: dict, seed: str | None = None) -> str:
+    """Return a stable per-session token for sticky proxy usernames."""
+    existing = str(session.get("_proxy_session_token") or "").strip()
+    if existing:
+        return existing
+
+    raw = str(seed or uuid.uuid4().hex).strip()
+    token = "".join(ch for ch in raw.lower() if ch.isalnum())[:24]
+    if not token:
+        token = uuid.uuid4().hex[:12]
+
+    session["_proxy_session_token"] = token
+    return token
 
 
 def clear_session(chat_id: int) -> None:

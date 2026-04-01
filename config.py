@@ -2,8 +2,11 @@
 Configuration and constants for the Pixel 10 Pro Google One Gemini Bot.
 """
 
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _load_local_env() -> None:
@@ -34,9 +37,44 @@ def _env_flag(name: str, default: str = "0") -> bool:
     """Return True for common truthy environment variable values."""
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
+
+def _env_int(name: str, default: int) -> int:
+    """Return an integer environment variable, falling back safely on bad input."""
+    raw_value = os.environ.get(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid integer for %s=%r; using fallback %s", name, raw_value, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Return a float environment variable, falling back safely on bad input."""
+    raw_value = os.environ.get(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid float for %s=%r; using fallback %s", name, raw_value, default)
+        return default
+
+
+def _env_text(name: str, default: str = "", allow_blank: bool = False) -> str:
+    """Return a string environment variable with optional blank fallback handling."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    value = raw_value.strip()
+    if not allow_blank and value == "":
+        return default
+    return value
+
 # ── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-BOT_HEADER_MEDIA_URL = os.environ.get(
+BOT_HEADER_MEDIA_URL = _env_text(
     "BOT_HEADER_MEDIA_URL",
     str(Path(__file__).resolve().parent / "assets" / "telegram" / "pixel-header.png"),
 )
@@ -50,10 +88,11 @@ ANDROID_SDK = "36"
 BUILD_ID = "AP4A.250405.002"
 DEVICE_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 DEVICE_LOCALE = "en-US"
-EMULATION_TIMEZONE_ID = os.environ.get("EMULATION_TIMEZONE_ID", "America/Los_Angeles")
-EMULATION_GEO_LATITUDE = float(os.environ.get("EMULATION_GEO_LATITUDE", "37.3861"))
-EMULATION_GEO_LONGITUDE = float(os.environ.get("EMULATION_GEO_LONGITUDE", "-122.0839"))
-EMULATION_GEO_ACCURACY = int(os.environ.get("EMULATION_GEO_ACCURACY", "100"))
+# Fallback emulation values used only when route-based geo detection is unavailable.
+EMULATION_TIMEZONE_ID = _env_text("EMULATION_TIMEZONE_ID", "America/Los_Angeles")
+EMULATION_GEO_LATITUDE = _env_float("EMULATION_GEO_LATITUDE", 37.3861)
+EMULATION_GEO_LONGITUDE = _env_float("EMULATION_GEO_LONGITUDE", -122.0839)
+EMULATION_GEO_ACCURACY = _env_int("EMULATION_GEO_ACCURACY", 100)
 
 # ── Auto-detect installed Chrome version ─────────────────────────────────────
 # Avoids UA/Client-Hints mismatch with the actual browser binary.
@@ -87,6 +126,15 @@ def _detect_chrome_version() -> tuple[str, int]:
     """Detect installed Chrome/Chromium version. Falls back to defaults."""
     import subprocess
 
+    def _parse_version_token(raw: str) -> tuple[str, int] | None:
+        for part in raw.split():
+            if "." in part and part[0].isdigit():
+                try:
+                    return part, int(part.split(".")[0])
+                except (TypeError, ValueError):
+                    return None
+        return None
+
     env_version = os.environ.get("CHROME_VERSION", "").strip()
     if env_version:
         try:
@@ -99,14 +147,30 @@ def _detect_chrome_version() -> tuple[str, int]:
             out = subprocess.check_output(
                 [path, "--version"], stderr=subprocess.DEVNULL, timeout=5,
             ).decode().strip()
-            # "Chromium 146.0.7680.80" or "Google Chrome 124.0.6367.82"
-            parts = out.split()
-            for part in parts:
-                if "." in part and part[0].isdigit():
-                    major = int(part.split(".")[0])
-                    return part, major
+            parsed = _parse_version_token(out)
+            if parsed:
+                return parsed
         except Exception:
-            continue
+            pass
+
+        if os.name == "nt" and os.path.exists(path):
+            try:
+                escaped_path = path.replace("'", "''")
+                out = subprocess.check_output(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-Command",
+                        f"(Get-Item '{escaped_path}').VersionInfo.ProductVersion",
+                    ],
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                ).decode().strip()
+                parsed = _parse_version_token(out)
+                if parsed:
+                    return parsed
+            except Exception:
+                pass
     return "124.0.6367.82", 124
 
 CHROME_VERSION, CHROME_MAJOR_VERSION = _detect_chrome_version()
@@ -161,18 +225,28 @@ WEBDRIVER_TIMEOUT = 30          # seconds – explicit wait
 IMPLICIT_WAIT = 10              # seconds
 PAGE_LOAD_TIMEOUT = 60          # seconds
 HEADLESS = True                # set to False for local debugging with visible browser
+BROWSER_IGNORE_CERT_ERRORS = _env_flag("BROWSER_IGNORE_CERT_ERRORS", "0")
+GOOGLE_PASSWORD_STAGE_TIMEOUT_SECONDS = _env_int("GOOGLE_PASSWORD_STAGE_TIMEOUT_SECONDS", 12)
+START_VISIBLE_WITH_AUTH_PROXY = _env_flag("START_VISIBLE_WITH_AUTH_PROXY", "1")
+GOOGLE_CAPTCHA_AUTO_SOLVE = _env_flag("GOOGLE_CAPTCHA_AUTO_SOLVE", "1")
+GOOGLE_CAPTCHA_MAX_AUDIO_ATTEMPTS = _env_int("GOOGLE_CAPTCHA_MAX_AUDIO_ATTEMPTS", 3)
+WIT_AI_TOKEN = _env_text("WIT_AI_TOKEN", "", allow_blank=True)
+WIT_AI_SPEECH_API_VERSION = _env_text("WIT_AI_SPEECH_API_VERSION", "20240304")
+WIT_AI_TIMEOUT_SECONDS = _env_int("WIT_AI_TIMEOUT_SECONDS", 45)
 
 # ── Proxy / Rotation ──────────────────────────────────────────────────────────
 PROXY_ENABLED = _env_flag("PROXY_ENABLED", "1")
-PROXY_FILE_PATH = os.environ.get(
+PROXY_FILE_PATH = _env_text(
     "PROXY_FILE_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt"),
 )
-PROXY_FAILURE_COOLDOWN_SECONDS = int(os.environ.get("PROXY_FAILURE_COOLDOWN_SECONDS", "90"))
-PROXY_QUARANTINE_SECONDS = int(os.environ.get("PROXY_QUARANTINE_SECONDS", "300"))
-PROXY_QUARANTINE_THRESHOLD = int(os.environ.get("PROXY_QUARANTINE_THRESHOLD", "3"))
+PROXY_FAILURE_COOLDOWN_SECONDS = _env_int("PROXY_FAILURE_COOLDOWN_SECONDS", 90)
+PROXY_QUARANTINE_SECONDS = _env_int("PROXY_QUARANTINE_SECONDS", 300)
+PROXY_QUARANTINE_THRESHOLD = _env_int("PROXY_QUARANTINE_THRESHOLD", 3)
 PROXY_PRECHECK_ENABLED = _env_flag("PROXY_PRECHECK_ENABLED", "1")
-PROXY_PRECHECK_TIMEOUT_SECONDS = int(os.environ.get("PROXY_PRECHECK_TIMEOUT_SECONDS", "12"))
+PROXY_PRECHECK_TIMEOUT_SECONDS = _env_int("PROXY_PRECHECK_TIMEOUT_SECONDS", 12)
+PROXY_DIAGNOSTICS_VERIFY_SSL = _env_flag("PROXY_DIAGNOSTICS_VERIFY_SSL", "0")
+BRIGHTDATA_STICKY_SESSION_ENABLED = _env_flag("BRIGHTDATA_STICKY_SESSION_ENABLED", "1")
 REGENERATE_DEVICE_ON_RETRY = _env_flag("REGENERATE_DEVICE_ON_RETRY", "1")
 
 # ── Email validation ──────────────────────────────────────────────────────────

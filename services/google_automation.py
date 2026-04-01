@@ -8,12 +8,14 @@ import json
 import logging
 import os
 import platform
+import random
 import time
 import zipfile
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
+import undetected_chromedriver as uc
 from selenium import webdriver
 from selenium.common.exceptions import (
     NoSuchElementException,
@@ -21,16 +23,26 @@ from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
 )
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 import config
-from core.proxy_manager import mask_proxy_url, parse_proxy_parts
+from core.proxy_manager import (
+    apply_brightdata_session,
+    is_brightdata_proxy,
+    mask_proxy_url,
+    parse_proxy_parts,
+)
 from services.device_simulator import DeviceProfile, PIXEL_10_PRO_SPECS as SPECS
+from services.proxy_forwarder import AuthenticatedProxyForwarder
+from services.wit_ai_solver import (
+    AudioCaptchaSolveError,
+    has_audio_captcha_challenge,
+    solve_audio_captcha_with_wit_ai,
+    wit_ai_is_available,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +60,19 @@ def proxy_server_argument(proxy_url: str) -> str:
     return f"{proxy['scheme']}://{proxy['host']}:{proxy['port']}"
 
 
+def _proxy_requires_auth(proxy_url: str | None) -> bool:
+    """Return True when the proxy URL contains username credentials."""
+    if not proxy_url:
+        return False
+    try:
+        proxy = parse_proxy_parts(proxy_url)
+    except Exception:
+        return False
+    return bool(proxy.get("username"))
+
+
 def build_proxy_auth_extension(proxy_url: str) -> str | None:
-    """Return a base64-encoded Chrome extension for proxy authentication."""
+    """Return a base64-encoded Chrome extension strictly for proxy authentication."""
     proxy = parse_proxy_parts(proxy_url)
     username = proxy["username"]
     password = proxy["password"]
@@ -59,48 +82,38 @@ def build_proxy_auth_extension(proxy_url: str) -> str | None:
 
     manifest = {
         "version": "1.0.0",
-        "manifest_version": 2,
+        "manifest_version": 3,
         "name": "AutoPixel Proxy Auth",
         "permissions": [
-            "proxy",
-            "storage",
-            "tabs",
             "webRequest",
-            "webRequestBlocking",
+            "webRequestAuthProvider",
+        ],
+        "host_permissions": [
             "<all_urls>",
         ],
         "background": {
-            "scripts": ["background.js"],
+            "service_worker": "background.js",
         },
-        "minimum_chrome_version": "88.0.0",
+        "minimum_chrome_version": "120.0.0.0",
     }
 
     background = f"""
-const config = {{
-  mode: "fixed_servers",
-  rules: {{
-    singleProxy: {{
-      scheme: "{proxy['scheme']}",
-      host: "{proxy['host']}",
-      port: parseInt("{proxy['port']}", 10)
-    }},
-    bypassList: ["localhost", "127.0.0.1"]
-  }}
-}};
-
-chrome.proxy.settings.set({{ value: config, scope: "regular" }}, function() {{}});
-
 chrome.webRequest.onAuthRequired.addListener(
-  function() {{
-    return {{
+  (details, callback) => {{
+    if (!details.isProxy) {{
+      callback({{}});
+      return;
+    }}
+
+    callback({{
       authCredentials: {{
         username: {json.dumps(username)},
         password: {json.dumps(password or "")}
       }}
-    }};
+    }});
   }},
   {{ urls: ["<all_urls>"] }},
-  ["blocking"]
+  ["asyncBlocking"]
 );
 """.strip()
 
@@ -153,13 +166,41 @@ def resolve_browser_binaries() -> tuple[Optional[str], Optional[str]]:
     return chrome_bin, chromedriver_path
 
 
+def _detect_driver_major_version(chromedriver_path: str | None) -> Optional[int]:
+    """Return the detected chromedriver major version, if available."""
+    import subprocess
+
+    if not chromedriver_path:
+        return None
+
+    try:
+        out = subprocess.check_output(
+            [chromedriver_path, "--version"],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode("utf-8", errors="replace").strip()
+    except Exception:
+        return None
+
+    for part in out.split():
+        if "." in part and part[0].isdigit():
+            try:
+                return int(part.split(".")[0])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def build_driver(
     profile: DeviceProfile,
     headless: Optional[bool] = None,
     proxy_url: str | None = None,
+    proxy_session_token: str | None = None,
 ) -> webdriver.Chrome:
     """Return a Chrome WebDriver configured for the device profile."""
-    options = Options()
+    runtime_proxy_url = apply_brightdata_session(proxy_url, proxy_session_token)
+    options = uc.ChromeOptions()
+    options.page_load_strategy = "eager"
     headless_enabled = config.HEADLESS if headless is None else headless
 
     if headless_enabled:
@@ -183,8 +224,17 @@ def build_driver(
     options.add_argument("--renderer-process-limit=2")
     options.add_argument("--js-flags=--max-old-space-size=512")
     options.add_argument("--disable-ipc-flooding-protection")
+    if config.BROWSER_IGNORE_CERT_ERRORS:
+        options.add_argument("--ignore-certificate-errors")
+        options.add_argument("--ignore-ssl-errors=yes")
+        options.set_capability("acceptInsecureCerts", True)
+        logger.warning(
+            "Browser certificate errors will be ignored for this session because BROWSER_IGNORE_CERT_ERRORS=1."
+        )
 
     chrome_bin, chromedriver_path = resolve_browser_binaries()
+    browser_major = config.CHROME_MAJOR_VERSION
+    driver_major = _detect_driver_major_version(chromedriver_path)
 
     if chrome_bin:
         options.binary_location = chrome_bin
@@ -194,50 +244,78 @@ def build_driver(
             "CHROME_BIN not found; relying on Selenium Manager/browser defaults."
         )
 
-    mobile_emulation = {
-        "deviceMetrics": {
-            "width": SPECS["width"],
-            "height": SPECS["height"],
-            "pixelRatio": SPECS["pixel_ratio"],
-            "mobile": True,
-            "touch": True,
-        },
-        "userAgent": profile.user_agent,
+    prefs = {
+        "webrtc.ip_handling_policy": "disable_non_proxied_udp",
+        "webrtc.multiple_routes_enabled": False,
+        "webrtc.nonproxied_udp_enabled": False,
+        "profile.default_content_setting_values.geolocation": 2,  # Block native geo popup
     }
-    options.add_experimental_option("mobileEmulation", mobile_emulation)
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
+    options.add_experimental_option("prefs", prefs)
     options.add_argument("--disable-blink-features=AutomationControlled")
 
     encoded_extension = None
-    if proxy_url:
-        encoded_extension = build_proxy_auth_extension(proxy_url)
-        if encoded_extension:
-            options.add_encoded_extension(encoded_extension)
+    proxy_forwarder = None
+    if runtime_proxy_url:
+        if _proxy_requires_auth(runtime_proxy_url):
+            proxy_forwarder = AuthenticatedProxyForwarder(runtime_proxy_url).start()
+            options.add_argument(f"--proxy-server={proxy_forwarder.local_proxy_url}")
         else:
-            options.add_argument(f"--proxy-server={proxy_server_argument(proxy_url)}")
-        logger.info("Using proxy: %s", mask_proxy_url(proxy_url))
+            options.add_argument(f"--proxy-server={proxy_server_argument(runtime_proxy_url)}")
+        logger.info("Using proxy: %s", mask_proxy_url(proxy_url or runtime_proxy_url))
 
     if not encoded_extension:
         options.add_argument("--disable-extensions")
 
-    if chromedriver_path:
+    driver_kwargs = {
+        "options": options,
+        "use_subprocess": False,
+        "version_main": browser_major,
+    }
+    if chromedriver_path and driver_major == browser_major:
         logger.info("Using chromedriver: %s", chromedriver_path)
-        service = Service(chromedriver_path)
-        driver = webdriver.Chrome(service=service, options=options)
+        driver_kwargs["driver_executable_path"] = chromedriver_path
+    elif chromedriver_path:
+        logger.warning(
+            "Ignoring chromedriver %s because major version %s does not match browser major %s.",
+            chromedriver_path,
+            driver_major if driver_major is not None else "unknown",
+            browser_major,
+        )
     else:
         logger.warning(
-            "CHROMEDRIVER_PATH not found; using Selenium Manager fallback."
+            "CHROMEDRIVER_PATH not found; using undetected-chromedriver fallback."
         )
-        driver = webdriver.Chrome(options=options)
+
+    if chrome_bin:
+        driver_kwargs["browser_executable_path"] = chrome_bin
+
+    try:
+        driver = uc.Chrome(**driver_kwargs)
+    except Exception:
+        if proxy_forwarder:
+            proxy_forwarder.stop()
+        raise
 
     setattr(driver, "_autopixel_headless", headless_enabled)
+    setattr(driver, "_autopixel_proxy_requires_auth", _proxy_requires_auth(runtime_proxy_url))
+    setattr(driver, "_autopixel_proxy_forwarder", proxy_forwarder)
 
     driver.implicitly_wait(config.IMPLICIT_WAIT)
     driver.set_page_load_timeout(config.PAGE_LOAD_TIMEOUT)
 
     try:
         driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd(
+            "Emulation.setDeviceMetricsOverride",
+            {
+                "width": SPECS["width"],
+                "height": SPECS["height"],
+                "deviceScaleFactor": SPECS["pixel_ratio"],
+                "mobile": True,
+                "screenWidth": SPECS["device_width"],
+                "screenHeight": SPECS["device_height"],
+            },
+        )
         driver.execute_cdp_cmd(
             "Page.addScriptToEvaluateOnNewDocument",
             {"source": profile.navigator_overrides_js()},
@@ -326,6 +404,20 @@ def get_signin_error_text(driver: webdriver.Chrome) -> str | None:
     return None
 
 
+def _looks_like_captcha_error_text(text: str | None) -> bool:
+    """Return True when Google is asking for an image/text captcha."""
+    normalized = " ".join((text or "").lower().split())
+    if not normalized:
+        return False
+    markers = (
+        "characters you see in the image above",
+        "text you hear or see",
+        "enter the characters",
+        "captcha",
+    )
+    return any(marker in normalized for marker in markers)
+
+
 def get_login_debug_snapshot(driver: webdriver.Chrome) -> dict[str, str]:
     """Return a small snapshot of the current login page for diagnostics."""
     current_url = ""
@@ -359,6 +451,50 @@ def get_login_debug_snapshot(driver: webdriver.Chrome) -> dict[str, str]:
         "title": title,
         "excerpt": excerpt,
     }
+
+
+def _looks_like_privacy_error_snapshot(snapshot: dict[str, str]) -> bool:
+    """Return True when Chrome is showing its certificate/privacy interstitial."""
+    title = (snapshot.get("title") or "").lower()
+    excerpt = (snapshot.get("excerpt") or "").lower()
+    url = (snapshot.get("url") or "").lower()
+    return any(
+        marker in f"{title} {excerpt} {url}"
+        for marker in (
+            "privacy error",
+            "your connection is not private",
+            "net::err_cert_authority_invalid",
+        )
+    )
+
+
+def _looks_like_brightdata_policy_block_snapshot(snapshot: dict[str, str]) -> bool:
+    """Return True when the page body looks like a Bright Data access-policy block."""
+    title = (snapshot.get("title") or "").lower()
+    excerpt = (snapshot.get("excerpt") or "").lower()
+    url = (snapshot.get("url") or "").lower()
+    combined = f"{title} {excerpt} {url}"
+    return any(
+        marker in combined
+        for marker in (
+            "residential failed (bad_endpoint)",
+            "bad_endpoint",
+            "immediate residential",
+            "full residential access",
+            "access mode",
+            "docs.brightdata.com",
+        )
+    )
+
+
+def _summarize_snapshot_excerpt(snapshot: dict[str, str], limit: int = 180) -> str:
+    """Return a short single-line excerpt for user-facing error messages."""
+    excerpt = " ".join((snapshot.get("excerpt") or "").split())
+    if not excerpt:
+        return ""
+    if len(excerpt) <= limit:
+        return excerpt
+    return excerpt[: limit - 3].rstrip() + "..."
 
 
 def get_google_login_state(driver: webdriver.Chrome) -> str:
@@ -459,10 +595,34 @@ def _is_totp_challenge(driver: webdriver.Chrome) -> bool:
     )
 
 
+def _try_wit_ai_audio_captcha(driver: webdriver.Chrome, stage_label: str) -> bool:
+    """Best-effort solve for visible audio captcha challenges."""
+    if not wit_ai_is_available():
+        return False
+
+    try:
+        solved = solve_audio_captcha_with_wit_ai(driver)
+    except AudioCaptchaSolveError as exc:
+        logger.warning("Wit.ai audio captcha solver failed during %s: %s", stage_label, exc)
+        return False
+    except Exception as exc:
+        logger.warning(
+            "Unexpected Wit.ai audio captcha error during %s: %s",
+            stage_label,
+            exc,
+        )
+        return False
+
+    if solved:
+        logger.info("Wit.ai audio captcha submitted during %s.", stage_label)
+    return solved
+
+
 def _resolve_post_password_state(driver: webdriver.Chrome, email: str) -> str:
     """Resolve the Google login state after password submission with retries."""
     deadline = time.time() + 15
     last_exc: Exception | None = None
+    captcha_solver_attempted = False
 
     while time.time() < deadline:
         try:
@@ -476,6 +636,16 @@ def _resolve_post_password_state(driver: webdriver.Chrome, email: str) -> str:
                 if _is_totp_challenge(driver):
                     logger.info("TOTP 2FA challenge confirmed for %s - awaiting code", email)
                     return "needs_totp"
+
+                if (
+                    not captcha_solver_attempted
+                    and wit_ai_is_available()
+                    and has_audio_captcha_challenge(driver)
+                ):
+                    captcha_solver_attempted = True
+                    if _try_wit_ai_audio_captcha(driver, "post-password challenge"):
+                        time.sleep(2)
+                        continue
 
                 switched_to_totp = False
                 try:
@@ -537,7 +707,14 @@ def _resolve_post_password_state(driver: webdriver.Chrome, email: str) -> str:
                     logger.warning("Error trying alternative 2FA: %s", exc)
 
                 page_text = driver.page_source.lower()
-                if "security key" in page_text or "usb" in page_text:
+                if (
+                    "text you hear or see" in page_text
+                    or "characters you see in the image above" in page_text
+                    or "enter the characters" in page_text
+                    or "captcha" in page_text
+                ):
+                    challenge_type = "captcha / audio verification"
+                elif "security key" in page_text or "usb" in page_text:
                     challenge_type = "security key"
                 elif "phone" in page_text or "sms" in page_text:
                     challenge_type = "SMS / phone verification"
@@ -613,31 +790,236 @@ def wait_for_any(
                 last_error = exc
                 continue
 
-            if element.is_displayed():
-                return element
+            try:
+                if element.is_displayed():
+                    return element
+            except StaleElementReferenceException as exc:
+                last_error = exc
+                continue
         time.sleep(0.5)
 
     raise TimeoutException(str(last_error) if last_error else "No matching visible element found.")
+
+
+def _send_keys_human_like(
+    element: WebElement,
+    value: str,
+    delay_min: float = 0.05,
+    delay_max: float = 0.2,
+) -> None:
+    """Type text one character at a time with small randomized delays."""
+    for char in value:
+        element.send_keys(char)
+        time.sleep(random.uniform(delay_min, delay_max))
+
+
+def _type_into_any(
+    driver: webdriver.Chrome,
+    selectors: tuple[tuple[str, str], ...],
+    value: str,
+    description: str,
+    attempts: int = 4,
+    timeout: int = config.WEBDRIVER_TIMEOUT,
+    delay_min: float = 0.05,
+    delay_max: float = 0.2,
+) -> None:
+    """Find an input field and type into it, retrying when Google rerenders."""
+    last_exc: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            field = wait_for_any(driver, selectors, timeout=timeout)
+            field.clear()
+            _send_keys_human_like(field, value, delay_min=delay_min, delay_max=delay_max)
+            return
+        except StaleElementReferenceException as exc:
+            last_exc = exc
+            logger.warning(
+                "Stale element while typing into %s, retrying (%d/%d)",
+                description,
+                attempt,
+                attempts,
+            )
+            time.sleep(0.6)
+
+    raise GoogleAutomationError(
+        f"{description.capitalize()} became unstable while typing. Please retry the session."
+    ) from last_exc
+
+
+def _click_element(
+    driver: webdriver.Chrome,
+    by: str,
+    value: str,
+    description: str,
+    attempts: int = 4,
+    timeout: int = config.WEBDRIVER_TIMEOUT,
+) -> None:
+    """Click an element with stale-element retries and a JS fallback."""
+    last_exc: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            element = wait_for(driver, by, value, timeout=timeout)
+            try:
+                element.click()
+            except WebDriverException:
+                driver.execute_script("arguments[0].click();", element)
+            return
+        except StaleElementReferenceException as exc:
+            last_exc = exc
+            logger.warning(
+                "Stale element while clicking %s, retrying (%d/%d)",
+                description,
+                attempt,
+                attempts,
+            )
+            time.sleep(0.6)
+
+    raise GoogleAutomationError(
+        f"{description.capitalize()} became unstable while clicking. Please retry the session."
+    ) from last_exc
+
+
+def _stop_page_load(driver: webdriver.Chrome) -> None:
+    """Best-effort stop for a page that is still loading after a timeout."""
+    try:
+        driver.execute_script("window.stop();")
+    except Exception:
+        pass
+
+
+def _wait_for_password_stage(driver: webdriver.Chrome) -> WebElement | None:
+    """Wait for Google's password step, failing faster when sign-in never advances."""
+    selectors = (
+        (By.CSS_SELECTOR, 'input[type="password"]'),
+        (By.CSS_SELECTOR, 'input[name="Passwd"]'),
+        (By.CSS_SELECTOR, 'input[autocomplete="current-password"]'),
+    )
+    deadline = time.time() + config.GOOGLE_PASSWORD_STAGE_TIMEOUT_SECONDS
+    re_clicked_identifier_next = False
+    captcha_solver_attempted = False
+
+    while time.time() < deadline:
+        for by, value in selectors:
+            try:
+                element = driver.find_element(by, value)
+            except NoSuchElementException:
+                continue
+            if element.is_displayed():
+                return element
+
+        detail = get_signin_error_text(driver)
+        captcha_detected = bool(detail and _looks_like_captcha_error_text(detail))
+        audio_captcha_detected = False
+        if not captcha_detected and not captcha_solver_attempted and wit_ai_is_available():
+            audio_captcha_detected = has_audio_captcha_challenge(driver)
+            captcha_detected = audio_captcha_detected
+
+        if captcha_detected:
+            challenge_type = (
+                "captcha / audio verification"
+                if audio_captcha_detected
+                else "captcha / image verification"
+            )
+            if not captcha_solver_attempted:
+                captcha_solver_attempted = True
+                if _try_wit_ai_audio_captcha(driver, "pre-password challenge"):
+                    time.sleep(2)
+                    continue
+
+            if not _driver_is_headless(driver):
+                setattr(driver, "_autopixel_challenge_type", challenge_type)
+                logger.info(
+                    "Manual verification required before password step: %s",
+                    challenge_type,
+                )
+                return None
+            raise GoogleAutomationError(
+                "Google requested captcha / image verification before the password step."
+            )
+
+        if detail:
+            raise GoogleAutomationError(f"Google sign-in rejected the login: {detail}")
+
+        # Google sometimes stays on the identifier step even after the first click.
+        try:
+            identifier = driver.find_element(By.CSS_SELECTOR, 'input[name="identifier"]')
+            if identifier.is_displayed() and not re_clicked_identifier_next:
+                try:
+                    driver.find_element(By.ID, "identifierNext").click()
+                    re_clicked_identifier_next = True
+                except Exception:
+                    pass
+        except NoSuchElementException:
+            pass
+
+        time.sleep(0.5)
+
+    snapshot = get_login_debug_snapshot(driver)
+    if "/signin/" in (snapshot.get("url") or "") and "email or phone" in (
+        (snapshot.get("excerpt") or "").lower()
+    ):
+        raise GoogleAutomationError(
+            "Google sign-in did not advance from the email step to the password step. "
+            "This can happen when Google is still evaluating the session, the page is loading slowly, "
+            "or an intermediate prompt/captcha is blocking progress."
+        )
+
+    raise TimeoutException("Password field did not appear in time.")
 
 
 def gmail_login(driver: webdriver.Chrome, email: str, password: str) -> str:
     """Perform Google login and return status: success, failed, or needs_totp."""
     try:
         driver.implicitly_wait(0)
-        driver.get(config.GMAIL_LOGIN_URL)
-        time.sleep(3)
-
+        proxy_requires_auth = bool(
+            getattr(driver, "_autopixel_proxy_requires_auth", False)
+        )
         email_selectors = (
             (By.CSS_SELECTOR, 'input[type="email"]'),
             (By.CSS_SELECTOR, 'input[name="identifier"]'),
             (By.CSS_SELECTOR, 'input[autocomplete="username"]'),
         )
 
+        if proxy_requires_auth:
+            logger.info(
+                "Authenticated proxy detected; waiting on a local init page so the auth extension can settle before the first external request."
+            )
+            driver.get("data:text/html,<title>AutoPixel Init</title><body>proxy-init</body>")
+            time.sleep(3.5)
+        else:
+            # --- MULAI INJEKSI WARM-UP ---
+            logger.info("Melakukan pemanasan profil (warm-up) sebelum login...")
+            try:
+                driver.get("https://news.google.com/")
+                time.sleep(random.uniform(3.0, 5.0))
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight/4);")
+                time.sleep(random.uniform(1.0, 2.0))
+            except TimeoutException as exc:
+                logger.warning("Warm-up page load timed out; continuing anyway: %s", exc)
+                _stop_page_load(driver)
+            # --- AKHIR INJEKSI WARM-UP ---
+
+        try:
+            driver.get(config.GMAIL_LOGIN_URL)
+        except TimeoutException as exc:
+            logger.warning(
+                "Google sign-in page load timed out before full completion; attempting to continue: %s",
+                exc,
+            )
+            _stop_page_load(driver)
+        time.sleep(3)
+
         for retry in range(3):
             try:
-                email_field = wait_for_any(driver, email_selectors)
-                email_field.clear()
-                email_field.send_keys(email)
+                _type_into_any(
+                    driver,
+                    email_selectors,
+                    email,
+                    "email field",
+                    attempts=3,
+                )
                 break
             except StaleElementReferenceException:
                 logger.warning("Stale element on email field, retrying (%d/3)", retry + 1)
@@ -645,20 +1027,23 @@ def gmail_login(driver: webdriver.Chrome, email: str, password: str) -> str:
         else:
             raise GoogleAutomationError("Email field stale after 3 retries")
 
-        wait_for(driver, By.ID, "identifierNext").click()
+        _click_element(driver, By.ID, "identifierNext", "email next button")
         time.sleep(1)
 
-        password_field = wait_for_any(
+        password_field = _wait_for_password_stage(driver)
+        if password_field is None:
+            return "needs_manual_verification"
+        _type_into_any(
             driver,
             (
                 (By.CSS_SELECTOR, 'input[type="password"]'),
                 (By.CSS_SELECTOR, 'input[name="Passwd"]'),
                 (By.CSS_SELECTOR, 'input[autocomplete="current-password"]'),
             ),
+            password,
+            "password field",
         )
-        password_field.clear()
-        password_field.send_keys(password)
-        wait_for(driver, By.ID, "passwordNext").click()
+        _click_element(driver, By.ID, "passwordNext", "password next button")
         time.sleep(2)
         return _resolve_post_password_state(driver, email)
 
@@ -671,6 +1056,29 @@ def gmail_login(driver: webdriver.Chrome, email: str, password: str) -> str:
             snapshot["title"] or "-",
             snapshot["excerpt"] or "-",
         )
+        if _looks_like_brightdata_policy_block_snapshot(snapshot):
+            summary = _summarize_snapshot_excerpt(snapshot)
+            raise GoogleAutomationError(
+                "Bright Data blocked this Google target for your Residential Immediate-Access zone "
+                "(no KYC / no Full Access). This page is coming from the proxy provider, not from Google. "
+                "Complete Bright Data KYC / Full Access, or switch this workflow to ISP, Data Center, "
+                "or direct mode."
+                + (f" Detail: {summary}" if summary else "")
+            ) from exc
+        if _looks_like_privacy_error_snapshot(snapshot):
+            if _is_brightdata_proxy(proxy_url):
+                raise GoogleAutomationError(
+                    "Chrome stopped at a privacy/certificate error for the Bright Data proxy. "
+                    "Bright Data Residential browser sessions usually require either their SSL "
+                    "certificate to be installed in Chrome or Bright Data KYC/Full Access. "
+                    "For browser automation, Bright Data recommends ISP/Data Center proxies. "
+                    "If you only want a temporary test bypass, set BROWSER_IGNORE_CERT_ERRORS=1."
+                ) from exc
+            raise GoogleAutomationError(
+                "Chrome stopped at a privacy/certificate error before the Google sign-in page loaded. "
+                "Check the proxy certificate chain or, for temporary testing only, set "
+                "BROWSER_IGNORE_CERT_ERRORS=1."
+            ) from exc
         detail = ""
         if snapshot["title"] or snapshot["excerpt"]:
             detail = (
@@ -712,7 +1120,9 @@ def submit_totp_code(driver: webdriver.Chrome, code: str) -> bool:
             return False
 
         totp_field.clear()
-        totp_field.send_keys(code)
+        for char in code:
+            totp_field.send_keys(char)
+            time.sleep(random.uniform(0.1, 0.3))
         time.sleep(0.5)
 
         for btn_selector in (
@@ -766,14 +1176,28 @@ def diagnose_google_one_page(driver: webdriver.Chrome) -> str | None:
         "free trial",
         "12-month",
         "12 month",
+        "freetrial",
+        "freetrialperiod",
+        "start trial",
+        "mulai uji coba",
+        "$0/bln",
+        "selama 1 bulan",
+        "data-sku-id=\"g1.2tb.ai.1month_eft\"",
+        "data-sku-id=\"g1.2tb.1month_eft\"",
     )
 
-    if any(marker in page_source for marker in paid_ai_markers):
-        if any(marker in page_source for marker in free_offer_markers):
+    if any(marker in page_source for marker in free_offer_markers):
+        if any(marker in page_source for marker in paid_ai_markers):
             return (
-                "Google One shows AI-related products, but the promo state is mixed "
-                "and needs manual review."
+                "Google One shows an embedded Google AI trial offer on the plans page, "
+                "but AutoPixel did not capture the checkout link automatically."
             )
+        return (
+            "Google One shows an embedded free-trial offer on the plans page, "
+            "but AutoPixel did not capture the checkout link automatically."
+        )
+
+    if any(marker in page_source for marker in paid_ai_markers):
         return (
             "Google One shows regular paid Google AI Pro plans for this account, "
             "but no free promo claim link was present."
@@ -790,41 +1214,149 @@ def is_correct_offer_url(url: str) -> bool:
     return bool(url) and "partner-eft-onboard" in url
 
 
+def _looks_like_checkout_url(url: str) -> bool:
+    """Return True when the URL looks like a Google subscription checkout flow."""
+    normalized = (url or "").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "partner-eft-onboard",
+            "subscriptions/checkout",
+            "store.google.com/subscriptions/checkout",
+            "play.google.com",
+            "tokenized.play.google.com",
+            "purchase",
+            "buy",
+        )
+    )
+
+
+def _trial_button_priority(button: WebElement) -> tuple[int, str]:
+    """Rank trial buttons so AI/Gemini-related monthly trials are preferred."""
+    sku_id = (button.get_attribute("data-sku-id") or "").lower()
+    label = " ".join(
+        part
+        for part in (
+            button.get_attribute("aria-label") or "",
+            button.text or "",
+            button.get_attribute("data-formatted-price") or "",
+        )
+    ).lower()
+
+    score = 0
+    if ".ai." in sku_id or "ai pro" in label or "gemini" in label:
+        score += 100
+    if "2tb" in sku_id or "2 tb" in label:
+        score += 30
+    if "1month" in sku_id or "trial" in label or "uji coba" in label:
+        score += 10
+    return (-score, sku_id)
+
+
+def _capture_checkout_after_trial_click(
+    driver: webdriver.Chrome,
+    button: WebElement,
+) -> Optional[str]:
+    """Click a Google One trial button and try to capture the checkout URL."""
+    before_url = driver.current_url
+    before_handles = list(driver.window_handles)
+
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+            button,
+        )
+    except Exception:
+        pass
+
+    time.sleep(0.6)
+    try:
+        button.click()
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", button)
+        except Exception as exc:
+            logger.warning("Failed to click Google One trial button: %s", exc)
+            return None
+
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        try:
+            current_handles = list(driver.window_handles)
+        except Exception:
+            current_handles = before_handles
+
+        if len(current_handles) > len(before_handles):
+            try:
+                driver.switch_to.window(current_handles[-1])
+            except Exception:
+                pass
+
+        try:
+            current_url = driver.current_url
+        except Exception:
+            current_url = ""
+
+        if current_url and current_url != before_url and _looks_like_checkout_url(current_url):
+            return current_url
+
+        try:
+            iframes = driver.find_elements(By.TAG_NAME, "iframe")
+            for frame in iframes:
+                src = (frame.get_attribute("src") or "").strip()
+                if src and _looks_like_checkout_url(src):
+                    return src
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+
+    return None
+
+
+def extract_trial_button_link(driver: webdriver.Chrome) -> Optional[str]:
+    """Try to launch a Google One trial checkout from page buttons."""
+    try:
+        buttons = driver.find_elements(By.CSS_SELECTOR, "button[data-sku-id]")
+    except Exception:
+        return None
+
+    candidates: list[WebElement] = []
+    for button in buttons:
+        try:
+            sku_id = (button.get_attribute("data-sku-id") or "").lower()
+            label = " ".join(
+                part
+                for part in (
+                    button.get_attribute("aria-label") or "",
+                    button.text or "",
+                    button.get_attribute("data-formatted-price") or "",
+                )
+            ).lower()
+        except StaleElementReferenceException:
+            continue
+
+        if not sku_id:
+            continue
+        if (
+            "1month" in sku_id
+            or "trial" in label
+            or "uji coba" in label
+            or "start trial" in label
+        ):
+            candidates.append(button)
+
+    for button in sorted(candidates, key=_trial_button_priority):
+        link = _capture_checkout_after_trial_click(driver, button)
+        if link:
+            return link
+
+    return None
+
+
 def extract_payment_link(driver: webdriver.Chrome) -> Optional[str]:
     """Scan current page for Gemini Pro offer activation link."""
     all_links = driver.find_elements(By.TAG_NAME, "a")
-
-    for link in all_links:
-        try:
-            href = link.get_attribute("href") or ""
-            if "LOCKED" in href and "BARD_ADVANCED" in href:
-                old_url = driver.current_url
-                driver.execute_script("arguments[0].click();", link)
-                time.sleep(5)
-                current_url = driver.current_url
-
-                if is_correct_offer_url(current_url):
-                    return current_url
-                if "LOCKED" in current_url:
-                    return None
-
-                if current_url != old_url:
-                    new_links = driver.find_elements(By.TAG_NAME, "a")
-                    for new_link in new_links:
-                        try:
-                            next_href = new_link.get_attribute("href") or ""
-                            if is_correct_offer_url(next_href):
-                                return next_href
-                        except Exception:
-                            continue
-
-                    if is_correct_offer_url(current_url):
-                        return current_url
-
-                return None
-        except Exception as exc:
-            logger.warning("Error clicking LOCKED link: %s", exc)
-            return None
 
     for link in all_links:
         try:
@@ -833,6 +1365,10 @@ def extract_payment_link(driver: webdriver.Chrome) -> Optional[str]:
                 return href
         except Exception:
             continue
+
+    trial_link = extract_trial_button_link(driver)
+    if trial_link:
+        return trial_link
 
     keywords = config.GEMINI_OFFER_KEYWORDS
     for link in all_links:
@@ -854,12 +1390,37 @@ def extract_payment_link(driver: webdriver.Chrome) -> Optional[str]:
         except Exception:
             continue
 
+    for link in all_links:
+        try:
+            href = link.get_attribute("href") or ""
+            if "LOCKED" not in href or "BARD_ADVANCED" not in href:
+                continue
+
+            old_url = driver.current_url
+            driver.execute_script("arguments[0].click();", link)
+            time.sleep(5)
+            current_url = driver.current_url
+
+            if is_correct_offer_url(current_url):
+                return current_url
+            if current_url != old_url and _looks_like_checkout_url(current_url):
+                return current_url
+            if "LOCKED" in current_url:
+                try:
+                    driver.back()
+                    time.sleep(1.5)
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("Error clicking LOCKED link: %s", exc)
+            continue
+
     return None
 
 
 def navigate_google_one(driver: webdriver.Chrome) -> Optional[str]:
     """Navigate Google One pages and attempt to find the offer link."""
-    for url in (config.GOOGLE_ONE_URL, config.GOOGLE_ONE_OFFERS_URL):
+    for url in (config.GOOGLE_ONE_OFFERS_URL, config.GOOGLE_ONE_URL):
         try:
             logger.info("Navigating to %s", url)
             driver.get(url)
@@ -945,9 +1506,22 @@ def start_login(
     device: DeviceProfile,
     headless: bool | None = None,
     proxy_url: str | None = None,
+    proxy_session_token: str | None = None,
 ) -> tuple:
     """Start login process and return (driver, status)."""
+    runtime_proxy_url = apply_brightdata_session(proxy_url, proxy_session_token)
+    proxy_requires_auth = _proxy_requires_auth(runtime_proxy_url)
     effective_headless = config.HEADLESS if headless is None else headless
+    if (
+        effective_headless
+        and proxy_requires_auth
+        and config.START_VISIBLE_WITH_AUTH_PROXY
+    ):
+        logger.info(
+            "Authenticated proxy detected for session %s; starting directly in visible mode.",
+            device.session_id,
+        )
+        effective_headless = False
     logger.info(
         "Starting WebDriver for session %s (headless=%s)",
         device.session_id,
@@ -957,13 +1531,14 @@ def start_login(
         device,
         headless=effective_headless,
         proxy_url=proxy_url,
+        proxy_session_token=proxy_session_token,
     )
 
     try:
         status = gmail_login(driver, email, password)
         if status == "failed":
             detail = get_signin_error_text(driver)
-            driver.quit()
+            close_driver(driver)
             if detail:
                 raise GoogleAutomationError(f"Google sign-in rejected the login: {detail}")
             raise GoogleAutomationError(
@@ -971,11 +1546,51 @@ def start_login(
                 "This can be caused by invalid credentials, account protection, or proxy issues."
             )
         return driver, status
-    except GoogleAutomationError:
-        driver.quit()
+    except GoogleAutomationError as exc:
+        should_retry_visible = (
+            effective_headless
+            and proxy_requires_auth
+            and (
+                "Timed out while loading the Google sign-in page" in str(exc)
+                or "captcha / image verification" in str(exc).lower()
+            )
+        )
+        if should_retry_visible:
+            logger.warning(
+                "Headless login hit a retryable Google/proxy barrier for session %s; retrying in visible mode.",
+                device.session_id,
+            )
+            close_driver(driver)
+            retry_driver = build_driver(
+                device,
+                headless=False,
+                proxy_url=proxy_url,
+                proxy_session_token=proxy_session_token,
+            )
+            try:
+                status = gmail_login(retry_driver, email, password)
+                if status == "failed":
+                    detail = get_signin_error_text(retry_driver)
+                    close_driver(retry_driver)
+                    if detail:
+                        raise GoogleAutomationError(
+                            f"Google sign-in rejected the login: {detail}"
+                        )
+                    raise GoogleAutomationError(
+                        "Google sign-in rejected the login after visible-mode retry. "
+                        "This can be caused by invalid credentials, account protection, or proxy issues."
+                    )
+                return retry_driver, status
+            except GoogleAutomationError:
+                close_driver(retry_driver)
+                raise
+            except Exception:
+                close_driver(retry_driver)
+                raise
+        close_driver(driver)
         raise
     except Exception:
-        driver.quit()
+        close_driver(driver)
         raise
 
 
@@ -1006,6 +1621,12 @@ def close_driver(driver) -> None:
             driver.quit()
         except Exception:
             pass
+        forwarder = getattr(driver, "_autopixel_proxy_forwarder", None)
+        if forwarder:
+            try:
+                forwarder.stop()
+            except Exception:
+                pass
 
 
 __all__ = [

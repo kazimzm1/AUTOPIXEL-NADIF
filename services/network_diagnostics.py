@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import ssl
 import time
 from collections.abc import Mapping
@@ -13,10 +14,20 @@ from urllib.request import HTTPSHandler, ProxyHandler, build_opener
 
 import httpx
 
-from core.proxy_manager import mask_proxy_url, normalize_proxy_url, parse_proxy_parts
+import config
+from core.proxy_manager import (
+    apply_brightdata_session,
+    is_brightdata_proxy,
+    mask_proxy_url,
+    normalize_proxy_url,
+    parse_proxy_parts,
+)
 
 IP_API_URL = "https://ipwho.is/"
 GOOGLE_SIGNIN_PROBE_URL = "https://accounts.google.com/signin/v2/identifier"
+BRIGHTDATA_PROXY_TEST_URL = "https://geo.brdtest.com/welcome.txt"
+
+logger = logging.getLogger(__name__)
 
 
 def _build_proxy_handler(proxy_url: str | None) -> ProxyHandler:
@@ -53,7 +64,49 @@ def _format_probe_error(prefix: str, exc: Exception) -> RuntimeError:
             f"{prefix}: Proxy authentication failed (407). "
             "Please rotate the proxy or verify the proxy username/password."
         )
+    if (
+        "bad_endpoint" in lowered
+        or "robots.txt" in lowered
+        or "policy_20130" in lowered
+        or "policy_20140" in lowered
+    ):
+        return RuntimeError(
+            f"{prefix}: Bright Data residential policy blocked this target "
+            "(`bad_endpoint`). Complete Bright Data KYC for Full access, "
+            "or switch to ISP/DataCenter/direct mode."
+        )
     return RuntimeError(f"{prefix}: {exc}")
+
+
+def _should_verify_ssl(proxy_url: str | None) -> bool:
+    """Keep strict TLS checks for direct traffic but allow proxy probes to relax them."""
+    return not proxy_url or config.PROXY_DIAGNOSTICS_VERIFY_SSL
+
+
+def _build_ssl_context(proxy_url: str | None) -> ssl.SSLContext:
+    """Return an SSL context that matches the configured probe verification mode."""
+    if _should_verify_ssl(proxy_url):
+        return ssl.create_default_context()
+    logger.warning(
+        "Skipping TLS certificate verification for proxy diagnostics via %s",
+        mask_proxy_url(proxy_url),
+    )
+    return ssl._create_unverified_context()
+
+
+def _resolve_probe_target(proxy_url: str | None) -> tuple[str, tuple[str, ...], str]:
+    """Pick a provider-safe probe URL for the current proxy route."""
+    if is_brightdata_proxy(proxy_url):
+        return (
+            BRIGHTDATA_PROXY_TEST_URL,
+            ("geo.brdtest.com",),
+            "Bright Data proxy test endpoint",
+        )
+    return (
+        GOOGLE_SIGNIN_PROBE_URL,
+        ("accounts.google.com", ".google.com"),
+        "Google sign-in",
+    )
 
 
 def _open_json_with_httpx(url: str, proxy_url: str | None, timeout: int = 15) -> dict:
@@ -62,6 +115,7 @@ def _open_json_with_httpx(url: str, proxy_url: str | None, timeout: int = 15) ->
         proxy=normalized_proxy,
         timeout=timeout,
         follow_redirects=True,
+        verify=_should_verify_ssl(proxy_url),
     ) as client:
         response = client.get(
             url,
@@ -81,7 +135,7 @@ def _open_json_with_httpx(url: str, proxy_url: str | None, timeout: int = 15) ->
 
 def _open_json_with_urllib(url: str, proxy_url: str | None, timeout: int = 15) -> dict:
     handler = _build_proxy_handler(proxy_url)
-    context = ssl.create_default_context()
+    context = _build_ssl_context(proxy_url)
     opener = build_opener(handler, HTTPSHandler(context=context))
     with opener.open(url, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8", errors="replace"))
@@ -99,6 +153,7 @@ def _probe_url_with_httpx(
         proxy=normalized_proxy,
         timeout=timeout,
         follow_redirects=True,
+        verify=_should_verify_ssl(proxy_url),
     ) as client:
         response = client.get(url, headers=headers)
         if response.status_code == 407:
@@ -115,7 +170,7 @@ def _probe_url_with_urllib(
     headers: dict[str, str] | None = None,
 ) -> tuple[int, str, float]:
     handler = _build_proxy_handler(proxy_url)
-    context = ssl.create_default_context()
+    context = _build_ssl_context(proxy_url)
     opener = build_opener(handler, HTTPSHandler(context=context))
     request = Request(url, headers=headers or {})
     started = time.perf_counter()
@@ -126,13 +181,17 @@ def _probe_url_with_urllib(
         return int(status_code), final_url, latency_ms
 
 
-def inspect_connection(proxy_url: str | None) -> dict[str, str]:
+def inspect_connection(
+    proxy_url: str | None,
+    proxy_session_token: str | None = None,
+) -> dict[str, str]:
     """Return masked proxy info plus public IP and geo summary."""
+    runtime_proxy_url = apply_brightdata_session(proxy_url, proxy_session_token)
     try:
-        payload = _open_json_with_httpx(IP_API_URL, proxy_url, timeout=15)
+        payload = _open_json_with_httpx(IP_API_URL, runtime_proxy_url, timeout=15)
     except Exception as exc:
         try:
-            payload = _open_json_with_urllib(IP_API_URL, proxy_url, timeout=15)
+            payload = _open_json_with_urllib(IP_API_URL, runtime_proxy_url, timeout=15)
         except URLError as fallback_exc:
             raise _format_probe_error(
                 "Failed to probe public IP",
@@ -183,7 +242,7 @@ def inspect_connection(proxy_url: str | None) -> dict[str, str]:
         "timezone_abbr": timezone_abbr,
     }
 
-    proxy_parts = parse_proxy_parts(proxy_url) if proxy_url else None
+    proxy_parts = parse_proxy_parts(runtime_proxy_url) if runtime_proxy_url else None
     if proxy_parts:
         result["proxy_host"] = f"{proxy_parts['host']}:{proxy_parts['port']}"
 
@@ -252,8 +311,10 @@ def format_connection_identity(
 def probe_google_signin(
     proxy_url: str | None,
     timeout: int = 12,
+    proxy_session_token: str | None = None,
 ) -> dict[str, str | float | int]:
-    """Return a quick reachability check for the Google sign-in page."""
+    """Return a quick reachability check for the current proxy route."""
+    runtime_proxy_url = apply_brightdata_session(proxy_url, proxy_session_token)
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -261,33 +322,37 @@ def probe_google_signin(
             "Chrome/124.0.0.0 Safari/537.36"
         )
     }
+    probe_url, expected_hosts, target_label = _resolve_probe_target(runtime_proxy_url)
     try:
         status_code, final_url, latency_ms = _probe_url_with_httpx(
-            GOOGLE_SIGNIN_PROBE_URL,
-            proxy_url,
+            probe_url,
+            runtime_proxy_url,
             timeout,
             headers=headers,
         )
     except Exception as exc:
         try:
             status_code, final_url, latency_ms = _probe_url_with_urllib(
-                GOOGLE_SIGNIN_PROBE_URL,
-                proxy_url,
+                probe_url,
+                runtime_proxy_url,
                 timeout,
                 headers=headers,
             )
         except URLError as fallback_exc:
             raise _format_probe_error(
-                "Failed to reach Google sign-in",
+                f"Failed to reach {target_label}",
                 fallback_exc.reason if getattr(fallback_exc, "reason", None) else fallback_exc,
             ) from fallback_exc
         except Exception as fallback_exc:
-            raise _format_probe_error("Failed to reach Google sign-in", fallback_exc) from fallback_exc
+            raise _format_probe_error(f"Failed to reach {target_label}", fallback_exc) from fallback_exc
 
     hostname = (urlsplit(final_url).hostname or "").lower()
-    if not (hostname == "accounts.google.com" or hostname.endswith(".google.com")):
+    if not any(
+        hostname == expected_host or hostname.endswith(expected_host)
+        for expected_host in expected_hosts
+    ):
         raise RuntimeError(
-            f"Unexpected response while probing Google sign-in: {hostname or final_url}"
+            f"Unexpected response while probing {target_label}: {hostname or final_url}"
         )
 
     return {

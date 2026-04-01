@@ -13,19 +13,32 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Send Telegram channel notification
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           REPOSITORY: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
           SHA: ${{ github.sha }}
           ACTOR: ${{ github.actor }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
           COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMPARE_URL: ${{ github.event.compare }}
         run: |
           python - <<'PY'
+          import html
+          import json
           import os
+          import subprocess
+          import urllib.error
           import urllib.parse
           import urllib.request
 
@@ -34,33 +47,226 @@ jobs:
           if not token or not chat_id:
               raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID GitHub secret.")
 
-          commit_message = (os.environ.get("COMMIT_MESSAGE") or "").strip() or "(no commit message)"
+          def telegram_call(method, payload):
+              data = urllib.parse.urlencode(payload).encode("utf-8")
+              request = urllib.request.Request(
+                  f"https://api.telegram.org/bot{token}/{method}",
+                  data=data,
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      body = response.read().decode("utf-8", errors="replace")
+                      print(f"{method} response: {body}")
+                      return json.loads(body)
+              except urllib.error.HTTPError as exc:
+                  error_body = exc.read().decode("utf-8", errors="replace")
+                  print(f"{method} failed: HTTP {exc.code}")
+                  print(error_body)
+                  raise
+
+          def run_git(*args):
+              return subprocess.check_output(
+                  ["git", *args],
+                  text=True,
+                  encoding="utf-8",
+                  errors="replace",
+              ).strip()
+
+          before_sha_full = (os.environ.get("BEFORE_SHA") or "").strip()
+          after_sha_full = (os.environ.get("SHA") or "").strip()
+          zero_sha = "0" * 40
+
+          def changed_file_list(*extra_args):
+              try:
+                  if before_sha_full and before_sha_full != zero_sha:
+                      raw = run_git("diff", *extra_args, f"{before_sha_full}..{after_sha_full}")
+                  else:
+                      raw = run_git("show", *extra_args, "--pretty=format:", "HEAD")
+              except Exception:
+                  return []
+              return [line.strip() for line in raw.splitlines() if line.strip()]
+
+          changed_files = changed_file_list("--name-only")
+          added_files = changed_file_list("--diff-filter=A", "--name-only")
+
+          if changed_files and all(path.startswith(".github/") for path in changed_files):
+              print("Skipping Telegram notification for workflow-only/internal changes.")
+              raise SystemExit(0)
+
+          try:
+              if before_sha_full and before_sha_full != zero_sha:
+                  shortstat = run_git("diff", "--shortstat", f"{before_sha_full}..{after_sha_full}")
+              else:
+                  shortstat = run_git("show", "--shortstat", "--format=", "HEAD")
+          except Exception:
+              shortstat = ""
+
+          commit_message = (os.environ.get("COMMIT_MESSAGE") or "").strip()
+          if not commit_message:
+              try:
+                  commit_message = run_git("log", "-1", "--pretty=%B")
+              except Exception:
+                  commit_message = ""
+          commit_message = commit_message.strip() or "(no commit message)"
+          commit_lines = [line.strip() for line in commit_message.splitlines()]
+          headline = commit_lines[0] if commit_lines else "(no commit message)"
+          details = [line for line in commit_lines[1:] if line]
           short_sha = (os.environ.get("SHA") or "")[:7]
+          before_sha = (os.environ.get("BEFORE_SHA") or "")[:7]
+          compare_url = os.environ.get("COMPARE_URL", "").strip()
+          full_text = "\n".join(commit_lines).lower()
+
+          has_docs = any(
+              path.lower().endswith((".md", ".txt"))
+              or path.lower() in {".env.example", "proxies.txt"}
+              for path in changed_files
+          )
+          has_new_feature = bool(added_files) or any(
+              signal in full_text
+              for signal in ("feat", "feature", "new ", "add ", "introduce", "/doctor", "self-check")
+          )
+          has_fix = any(
+              signal in full_text
+              for signal in ("fix", "bug", "safer", "stability", "compat", "repair", "fallback", "crash")
+          ) or any(path.lower().endswith(".py") for path in changed_files)
+
+          badges = []
+          if has_new_feature:
+              badges.append("<code>🆕 NEW FEATURE</code>")
+          if has_fix:
+              badges.append("<code>🛠️ FIX</code>")
+          if has_docs:
+              badges.append("<code>📚 DOCS</code>")
+          if not badges:
+              badges.append("<code>✨ UPDATE</code>")
+
+          def touches(*prefixes):
+              return any(
+                  path == prefix or path.startswith(prefix.rstrip("/") + "/")
+                  for path in changed_files
+                  for prefix in prefixes
+              )
+
+          product_highlights = []
+          if touches("services/setup_diagnostics.py", "main.py", "handlers/session_handlers.py", "handlers/ui.py"):
+              product_highlights.append("🩺 Add /doctor setup self-check and clearer first-run diagnostics for new users.")
+          if touches("config.py"):
+              product_highlights.append("🛡️ Make .env parsing safer so invalid numeric values do not crash startup.")
+          if touches("handlers/session_handlers.py", "handlers/ui.py", ".env.example"):
+              product_highlights.append("🧭 Expand /ip output with env-ready emulation timezone and GPS values for easier setup.")
+          if touches("services/google_automation.py", "services/device_simulator.py", "services/proxy_forwarder.py", "handlers/auth_handlers.py", "handlers/offer_handlers.py"):
+              product_highlights.append("🎯 Improve Google One / Pixel automation flow, session realism, and proxy-aware behavior.")
+          if touches("README.md", "CARA JALANKAN.txt", "CHANGELOG.md", ".env.example"):
+              product_highlights.append("📚 Refresh onboarding docs, run guide, and sample environment config for easier first use.")
+          if touches("proxies.txt", ".gitignore"):
+              product_highlights.append("🌐 Keep proxies.txt as a tracked sample file so users can start from a ready template.")
+
+          deduped_highlights = []
+          for item in product_highlights:
+              if item not in deduped_highlights:
+                  deduped_highlights.append(item)
+          product_highlights = deduped_highlights[:5]
+
+          release_mode = "major" if (
+              len(product_highlights) >= 3
+              or bool(added_files)
+              or touches("main.py", "config.py", "services", "handlers")
+          ) else "minor"
+          release_banner = (
+              "🔥 <b>AUTOPIXEL MAJOR RELEASE</b>"
+              if release_mode == "major"
+              else "✨ <b>AUTOPIXEL MINOR UPDATE</b>"
+          )
+          release_subtitle = (
+              "<code>⌬ GOOGLE ONE • PIXEL • USER-FACING UPDATE</code>"
+              if release_mode == "major"
+              else "<code>⌬ GOOGLE ONE • PIXEL • POLISH UPDATE</code>"
+          )
+          mode_badge = (
+              "<code>🚨 MAJOR RELEASE</code>"
+              if release_mode == "major"
+              else "<code>🔹 MINOR UPDATE</code>"
+          )
+
+          def file_icon(path):
+              lowered = path.lower()
+              if lowered.endswith(".py"):
+                  return "🐍"
+              if lowered.endswith((".md", ".txt")):
+                  return "📘"
+              if lowered.endswith((".yml", ".yaml")):
+                  return "⚙️"
+              if lowered.endswith(".json"):
+                  return "🧩"
+              return "📄"
+
+          file_lines = []
+          for path in changed_files[:6]:
+              file_lines.append(f"┣ {file_icon(path)} <code>{html.escape(path)}</code>")
+          if changed_files:
+              file_lines[-1] = file_lines[-1].replace("┣", "┗", 1)
+          else:
+              file_lines.append("┗ <i>No file list available.</i>")
+          if len(changed_files) > 6:
+              file_lines.append(f"➕ <i>{len(changed_files) - 6} more files changed</i>")
+
+          detail_lines = (
+              [f"┣ ✦ {html.escape(line)}" for line in details[:-1]]
+              + ([f"┗ ✦ {html.escape(details[-1])}"] if details else [])
+          )
+          highlight_lines = (
+              [f"┣ {html.escape(line)}" for line in product_highlights[:-1]]
+              + ([f"┗ {html.escape(product_highlights[-1])}"] if product_highlights else [])
+          )
+          if not highlight_lines:
+              highlight_lines = ["┗ <i>User-facing highlights were not detected automatically for this commit.</i>"]
           text = "\n".join(
               [
-                  "Repository update pushed",
-                  f"Repo: {os.environ.get('REPOSITORY', '-')}",
-                  f"Branch: {os.environ.get('BRANCH', '-')}",
-                  f"Commit: {short_sha}",
-                  f"Author: {os.environ.get('ACTOR', '-')}",
-                  f"Message: {commit_message}",
-                  f"URL: {os.environ.get('COMMIT_URL', '-')}",
+                  release_banner,
+                  release_subtitle,
+                  "",
+                  " ".join([mode_badge, *badges]),
+                  "",
+                  "┏ <b>Build Info</b>",
+                  f"┣ 📦 Repo: <code>{html.escape(os.environ.get('REPOSITORY', '-'))}</code>",
+                  f"┣ 🌿 Branch: <code>{html.escape(os.environ.get('BRANCH', '-'))}</code>",
+                  f"┣ 🔖 Commit: <code>{html.escape(short_sha)}</code>",
+                  f"┣ 🔄 Range: <code>{html.escape(before_sha or 'manual')} → {html.escape(short_sha)}</code>",
+                  f"┣ 👤 Author: <code>{html.escape(os.environ.get('ACTOR', '-'))}</code>",
+                  f"┗ ⚙️ Event: <code>{html.escape(os.environ.get('EVENT_NAME', '-'))}</code>",
+                  "",
+                  "┏ <b>What Users Need To Know</b>",
+                  *highlight_lines,
+                  "",
+                  "┏ <b>Release Headline</b>",
+                  f"┗ 📝 <b>{html.escape(headline)}</b>",
+                  "",
+                  "┏ <b>Included Updates</b>",
+                  *(detail_lines or ["┗ ✦ <i>No detailed changelog lines were included in the commit body.</i>"]),
+                  "",
+                  "┏ <b>Files Changed</b>",
+                  *file_lines,
+                  *( [f"📊 <i>{html.escape(shortstat)}</i>"] if shortstat else [f"📊 <i>{len(changed_files)} file(s) changed</i>"] ),
+                  "",
+                  "┏ <b>Quick Links</b>",
+                  f"┣ 🔗 <a href=\"{html.escape(os.environ.get('COMMIT_URL', '-'))}\">Open Commit</a>",
+                  f"┣ 🧭 <a href=\"{html.escape(os.environ.get('RUN_URL', '-'))}\">Open Workflow Run</a>",
+                  f"┗ 🪄 <a href=\"{html.escape(compare_url or os.environ.get('COMMIT_URL', '-'))}\">View Compare</a>",
+                  "",
+                  "✦ <b>Status</b>: <code>Delivered by GitHub Actions</code>",
+                  "✦ <i>Modern repo pulse focused on AUTOPIXEL product changes for channel users</i>",
               ]
           )
 
-          payload = urllib.parse.urlencode(
+          telegram_call("getMe", {})
+          telegram_call("getChat", {"chat_id": chat_id})
+          telegram_call(
+              "sendMessage",
               {
                   "chat_id": chat_id,
                   "text": text,
+                  "parse_mode": "HTML",
                   "disable_web_page_preview": "true",
-              }
-          ).encode("utf-8")
-
-          request = urllib.request.Request(
-              f"https://api.telegram.org/bot{token}/sendMessage",
-              data=payload,
+              },
           )
-          with urllib.request.urlopen(request, timeout=30) as response:
-              body = response.read().decode("utf-8", errors="replace")
-              print(body)
           PY

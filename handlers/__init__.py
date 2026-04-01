@@ -3,6 +3,7 @@
 from handlers.auth_handlers import (
     AWAIT_EMAIL,
     AWAIT_PASSWORD,
+    AWAIT_WIT_AI_TOKEN,
     lang_en,
     lang_id,
     login_cancel,
@@ -11,6 +12,9 @@ from handlers.auth_handlers import (
     login_start,
     logout,
     start,
+    wit_ai_cancel,
+    wit_ai_start,
+    wit_ai_token,
 )
 from handlers.offer_handlers import (
     AWAIT_2FA_CODE,
@@ -22,6 +26,7 @@ from handlers.offer_handlers import (
     offer_timeout,
 )
 from handlers.session_handlers import (
+    doctor,
     disable_proxy,
     get_link,
     ip_status,
@@ -39,12 +44,16 @@ __all__ = [
     "login_email",
     "login_password",
     "login_cancel",
+    "wit_ai_start",
+    "wit_ai_token",
+    "wit_ai_cancel",
     "logout",
     "check_offer",
     "handle_2fa_code",
     "handle_manual_verification",
     "cancel_2fa",
     "offer_timeout",
+    "doctor",
     "disable_proxy",
     "get_link",
     "ip_status",
@@ -54,6 +63,7 @@ __all__ = [
     "session_cleanup_job",
     "AWAIT_EMAIL",
     "AWAIT_PASSWORD",
+    "AWAIT_WIT_AI_TOKEN",
     "AWAIT_2FA_CODE",
     "AWAIT_MANUAL_VERIFICATION",
 ]

@@ -4,6 +4,7 @@ import json
 import random
 import string
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import config
@@ -83,6 +84,44 @@ def random_build_id() -> str:
         "AP3A.241205.015",
     ]
     return random.choice(builds)
+
+
+def _safe_float(value, default: float) -> float:
+    """Return a float value or the provided fallback."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value, default: int) -> int:
+    """Return an int value or the provided fallback."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def resolve_emulation_settings(
+    network_identity: Mapping[str, str] | None = None,
+) -> dict[str, str | float | int]:
+    """Return timezone/GPS settings, preferring the active proxy identity."""
+    timezone_id = config.EMULATION_TIMEZONE_ID
+    latitude = config.EMULATION_GEO_LATITUDE
+    longitude = config.EMULATION_GEO_LONGITUDE
+    accuracy = config.EMULATION_GEO_ACCURACY
+
+    if network_identity:
+        timezone_id = str(network_identity.get("timezone") or timezone_id)
+        latitude = _safe_float(network_identity.get("latitude"), latitude)
+        longitude = _safe_float(network_identity.get("longitude"), longitude)
+
+    return {
+        "timezone_id": timezone_id,
+        "geolocation_latitude": latitude,
+        "geolocation_longitude": longitude,
+        "geolocation_accuracy": _safe_int(accuracy, config.EMULATION_GEO_ACCURACY),
+    }
 
 
 @dataclass
@@ -197,10 +236,44 @@ class DeviceProfile:
         })
         return f"""
         (() => {{
+            const makeFnsNative = (fns) => {{
+                const oldCall = Function.prototype.call;
+                function call() {{
+                    return oldCall.apply(this, arguments);
+                }}
+                Function.prototype.call = call;
+                const nativeToStringFunctionString = Error.toString().replace(
+                    /Error/g,
+                    "toString"
+                );
+                const oldToString = Function.prototype.toString;
+                function functionToString() {{
+                    for (const fn of fns) {{
+                        if (this === fn.ref) {{
+                            return `function ${{fn.name}}() {{ [native code] }}`;
+                        }}
+                    }}
+                    if (this === functionToString) {{
+                        return nativeToStringFunctionString;
+                    }}
+                    return oldCall.call(oldToString, this);
+                }}
+                Object.defineProperty(Function.prototype, "toString", {{
+                    value: functionToString,
+                    configurable: true,
+                    enumerable: false,
+                    writable: true,
+                }});
+            }};
+
+            const fnsToMask = [];
+
             const defineGetter = (target, key, value) => {{
                 try {{
+                    const getter = () => value;
+                    fnsToMask.push({{ ref: getter, name: `get ${{key}}` }});
                     Object.defineProperty(target, key, {{
-                        get: () => value,
+                        get: getter,
                         configurable: true,
                     }});
                 }} catch (error) {{}}
@@ -208,12 +281,18 @@ class DeviceProfile:
 
             const defineValue = (target, key, value) => {{
                 try {{
+                    if (typeof value === 'function') {{
+                        fnsToMask.push({{ ref: value, name: key }});
+                    }}
                     Object.defineProperty(target, key, {{
                         value,
                         configurable: true,
                     }});
                 }} catch (error) {{}}
             }};
+
+            // Jadwalkan penyamaran fungsi agar tereksekusi segera
+            setTimeout(() => makeFnsNative(fnsToMask), 0);
 
             const lowEntropyUaData = {{
                 brands: {brands_json},
@@ -343,18 +422,37 @@ class DeviceProfile:
             Intl.DateTimeFormat.prototype = origDateTimeFormat.prototype;
             defineValue(Intl.DateTimeFormat, "supportedLocalesOf", origDateTimeFormat.supportedLocalesOf);
 
+            if (
+                typeof CanvasRenderingContext2D !== "undefined" &&
+                CanvasRenderingContext2D.prototype.getImageData
+            ) {{
+                const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+                defineValue(CanvasRenderingContext2D.prototype, "getImageData", function() {{
+                    const imageData = origGetImageData.apply(this, arguments);
+                    if (imageData && imageData.data && imageData.data.length >= 3) {{
+                        imageData.data[2] = Math.min(
+                            255,
+                            imageData.data[2] + {self.canvas_noise_blue}
+                        );
+                    }}
+                    return imageData;
+                }});
+            }}
+
             if (typeof HTMLCanvasElement !== "undefined" && HTMLCanvasElement.prototype.toDataURL) {{
                 const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-                HTMLCanvasElement.prototype.toDataURL = function(type) {{
+                defineValue(HTMLCanvasElement.prototype, "toDataURL", function() {{
                     const ctx = this.getContext("2d");
                     if (ctx) {{
-                        const style = ctx.fillStyle;
-                        ctx.fillStyle = "rgba(0,0,{self.canvas_noise_blue},0.01)";
-                        ctx.fillRect(0, 0, 1, 1);
-                        ctx.fillStyle = style;
+                        try {{
+                            const style = ctx.fillStyle;
+                            ctx.fillStyle = "rgba(0,0,{self.canvas_noise_blue},0.01)";
+                            ctx.fillRect(0, 0, 1, 1);
+                            ctx.fillStyle = style;
+                        }} catch (error) {{}}
                     }}
                     return origToDataURL.apply(this, arguments);
-                }};
+                }});
             }}
         }})();
         """
@@ -371,7 +469,9 @@ class DeviceProfile:
         )
 
 
-def create_device_profile() -> DeviceProfile:
+def create_device_profile(
+    network_identity: Mapping[str, str] | None = None,
+) -> DeviceProfile:
     """Create a fresh Pixel 10 Pro device profile with unique identifiers."""
     build_id = random_build_id()
     chrome_version = random_chrome_patch()
@@ -387,6 +487,7 @@ def create_device_profile() -> DeviceProfile:
         build_id,
         config.ANDROID_VERSION,
     )
+    emulation = resolve_emulation_settings(network_identity)
     return DeviceProfile(
         imei=generate_imei(),
         android_id=generate_android_id(),
@@ -394,6 +495,10 @@ def create_device_profile() -> DeviceProfile:
         user_agent=user_agent,
         chrome_version=chrome_version,
         build_id=build_id,
+        timezone_id=str(emulation["timezone_id"]),
+        geolocation_latitude=float(emulation["geolocation_latitude"]),
+        geolocation_longitude=float(emulation["geolocation_longitude"]),
+        geolocation_accuracy=int(emulation["geolocation_accuracy"]),
     )
 
 

@@ -2,6 +2,19 @@
 
 This file documents the feature baseline of AutoPixel.
 
+## [1.1.0] - 2026-03-31
+
+### User-Facing Google One / Pixel Improvements
+- Added `/doctor` onboarding diagnostics so new users can validate bot token, Chrome detection, `.env`, header media, and proxy pool readiness before running a live login.
+- Expanded `/ip` output with `.env`-ready emulation values so timezone, latitude, longitude, and accuracy can be copied into fallback config when needed.
+- Clarified direct-mode and proxy behavior in the sample configuration so users understand that `PROXY_ENABLED=0` is the clean way to start without proxies.
+- Kept `proxies.txt` as a tracked sample file so first-time users can start from a ready format instead of creating the file from scratch.
+
+### Product Readiness
+- Improved onboarding documentation across `README.md`, `CARA JALANKAN.txt`, and `.env.example` so fresh installs are easier to complete on Windows and Termux.
+- Documented the current Google One / Pixel offer support matrix and eligibility caveats more clearly for users checking the promo in different regions.
+- Added a clearer release summary path so channel notifications can explain Google One / Pixel improvements in a user-facing way instead of only mentioning internal workflow changes.
+
 ## [1.0.0] - 2026-03-26
 
 ### Product Scope
@@ -41,6 +54,7 @@ This file documents the feature baseline of AutoPixel.
 ### Bot UX
 - Modernized command UX with persistent main menu keyboard
 - Inline quick actions for frequent commands
+- Added `/doctor` first-run setup diagnostics for new-user onboarding
 - Localized language preference switch commands:
   - `/lang_en`
   - `/lang_id`
@@ -51,6 +65,7 @@ This file documents the feature baseline of AutoPixel.
 - Session credential storage uses in-memory `bytearray` values
 - Secure wipe routine for credentials at flow termination
 - Password and sensitive code chat message deletion attempts
+- Environment parsing now falls back safely on bad numeric `.env` values instead of crashing at import time
 - Per-user cooldown for offer checks
 - Concurrency limiting for browser sessions to reduce resource contention
 
@@ -76,4 +91,4 @@ This file documents the feature baseline of AutoPixel.
   - Region support matrix
   - Eligibility checklist
   - Troubleshooting by symptom
-  - Local and Docker quick-start guidance
+  - Windows PowerShell, Windows CMD, and Android Termux quick-start guidance

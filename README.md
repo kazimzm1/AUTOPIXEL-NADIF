@@ -10,6 +10,7 @@ AutoPixel is a Telegram bot that simulates a Pixel 10 Pro session, signs in to a
 - Simulates a fresh Pixel 10 Pro device profile for each login session
 - Supports Gmail and Google Workspace accounts
 - Handles Google sign-in with TOTP / authenticator flow support
+- Can attempt audio captcha solving through `wit.ai` before falling back to manual verification
 - Checks Google One pages for Gemini / AI Pro offer availability
 - Supports proxy pool rotation and direct/local IP mode
 - Shows public IP, region, ZIP, org, ISP, ASN, timezone, and other proxy identity details
@@ -20,6 +21,18 @@ AutoPixel is a Telegram bot that simulates a Pixel 10 Pro session, signs in to a
   - 2-column grid buttons
   - `[·]` section cards
   - emoji-rich menu labels
+
+## Latest Product Update
+
+As of **March 31, 2026**, the current user-facing baseline includes:
+
+- `/doctor` to validate first-run setup before you test a real Google account
+- `/ip` output that now exposes `.env`-ready emulation timezone and GPS values
+- safer `.env` handling so bad numeric fallback values do not break startup
+- a tracked sample `proxies.txt` file for quicker proxy onboarding
+- refreshed Google One / Pixel onboarding docs and region guidance
+
+This update is meant to make the project easier for first-time users to configure, diagnose, and understand before they run a live offer check.
 
 ## Documentation
 
@@ -55,7 +68,9 @@ Official sources:
 | Command | Function |
 |---|---|
 | `/start` | Open the Pixel Control Panel |
+| `/doctor` | Run a first-time setup self-check |
 | `/login` | Save Google email + password and create a fresh device session |
+| `/witai` | Save or clear the Wit.ai token used for audio captcha solving |
 | `/check_offer` | Start login automation and scan Google One for an offer |
 | `/get_link` | Show the last captured offer link |
 | `/status` | Show account, proxy, and device session info |
@@ -119,6 +134,8 @@ AUTOPIXEL/
 
 For the full plain-text run guide, see [`CARA JALANKAN.txt`](CARA%20JALANKAN.txt).
 
+After the bot starts for the first time, run `/doctor` in Telegram to verify token, Chrome detection, header media, proxy pool readiness, and driver configuration before testing a real account.
+
 ### Windows PowerShell
 
 ```powershell
@@ -168,11 +185,14 @@ TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
 BOT_HEADER_MEDIA_URL=
 CHROME_BIN=
 CHROMEDRIVER_PATH=
+GOOGLE_CAPTCHA_AUTO_SOLVE=1
+WIT_AI_TOKEN=
 PROXY_ENABLED=1
 PROXY_FILE_PATH=
 PROXY_FAILURE_COOLDOWN_SECONDS=90
 PROXY_QUARANTINE_SECONDS=300
 PROXY_QUARANTINE_THRESHOLD=3
+PROXY_DIAGNOSTICS_VERIFY_SSL=0
 ```
 
 Notes:
@@ -180,6 +200,9 @@ Notes:
 - `BOT_HEADER_MEDIA_URL` supports a local image path, image URL, GIF URL, or MP4 URL
 - if `BOT_HEADER_MEDIA_URL` is empty, the bot uses the bundled local banner asset
 - if `CHROMEDRIVER_PATH` is empty, the runtime falls back to automatic driver resolution
+- you can also set the Wit.ai token from Telegram with `/witai` and the bot will store it in `.env`
+- set `WIT_AI_TOKEN` if you want AutoPixel to try solving audio captcha challenges automatically
+- `PROXY_DIAGNOSTICS_VERIFY_SSL=0` lets `/ip` and proxy precheck tolerate self-signed/intercepted TLS chains often seen on proxy routes
 
 ### Optional proxies
 
@@ -203,14 +226,15 @@ user:pass@ip:port
 ## Typical Flow
 
 1. Send `/start`
-2. Send `/lang_id` if you want Indonesian UI
-3. Send `/login`
-4. Enter email
-5. Enter password, or `password|totp_secret`
-6. Check `/ip` or `/proxy`
-7. Send `/check_offer`
-8. If 2FA is requested, send the 6-digit code in Telegram
-9. Review the result or debug artifacts
+2. Send `/doctor` to validate first-run setup
+3. Send `/lang_id` if you want Indonesian UI
+4. Send `/login`
+5. Enter email
+6. Enter password, or `password|totp_secret`
+7. Check `/ip` or `/proxy`
+8. Send `/check_offer`
+9. If 2FA is requested, send the 6-digit code in Telegram
+10. Review the result or debug artifacts
 
 ## Success Example
 
@@ -305,9 +329,11 @@ Created by Nadif Rizky.
 
 | Issue | Fix |
 |---|---|
+| You are not sure whether the bot is ready for first-time use | Run `/doctor` in Telegram and fix any warning before testing a real account |
 | `No module named 'telegram'` or another missing package | Activate `.venv`, then run `pip install -r requirements.txt` again |
 | `409 Conflict` | Stop duplicate `main.py` bot processes and restart one instance only |
 | `/check_offer` says no credentials | Run `/login` again because the session password has already been cleared |
+| Google gets stuck on an audio captcha | Set `WIT_AI_TOKEN` in `.env` so AutoPixel can try the audio challenge automatically, or finish it manually in Chrome |
 | Proxy is selected but traffic still looks direct, or proxy precheck fails | Check `/proxy` and `/ip`, then rotate or replace the proxy pool, or switch to direct mode |
 | No offer found | Review account region, billing profile, payments setup, and whether the promo was already claimed |
 | Termux runs the bot but browser automation fails | Use Windows, Linux, or macOS with desktop Chrome for full automation support |

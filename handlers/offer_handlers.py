@@ -9,9 +9,10 @@ from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
 
 import config
-from core.proxy_manager import PROXY_MANAGER, mask_proxy_url
+from core.proxy_manager import PROXY_MANAGER, mask_proxy_url, parse_proxy_parts
 from core.session_manager import (
     SESSION_STORE,
+    ensure_proxy_session_token,
     get_session,
     secure_wipe,
 )
@@ -45,6 +46,27 @@ AWAIT_MANUAL_VERIFICATION = 11
 LAST_CHECK_TIME: dict[int, float] = {}
 CHECK_OFFER_COOLDOWN = 5 * 60  # 5 minutes between checks per user
 CHROME_SEMAPHORE = asyncio.Semaphore(1)
+DIAGNOSTIC_I18N_KEYS = {
+    (
+        "Google One shows AI-related products, but the promo state is mixed "
+        "and needs manual review."
+    ): "offer_diag_ai_mixed",
+    (
+        "Google One shows regular paid Google AI Pro plans for this account, "
+        "but no free promo claim link was present."
+    ): "offer_diag_paid_no_free",
+    "Google One loaded your normal account plan page, but no promo card was present.": (
+        "offer_diag_normal_plan_no_promo"
+    ),
+    (
+        "Google One shows an embedded Google AI trial offer on the plans page, "
+        "but AutoPixel did not capture the checkout link automatically."
+    ): "offer_diag_embedded_ai_trial",
+    (
+        "Google One shows an embedded free-trial offer on the plans page, "
+        "but AutoPixel did not capture the checkout link automatically."
+    ): "offer_diag_embedded_trial",
+}
 
 
 def _clear_pending_verification(session: dict) -> None:
@@ -52,26 +74,46 @@ def _clear_pending_verification(session: dict) -> None:
     session.pop("_manual_challenge_type", None)
 
 
-def _format_artifact_note(artifacts: dict[str, str] | None) -> str:
+def _translate_diagnostic(context, diagnostic: str | None) -> str | None:
+    """Return a localized diagnosis string when a known diagnostic is available."""
+    if not diagnostic:
+        return None
+
+    key = DIAGNOSTIC_I18N_KEYS.get(diagnostic)
+    return tr(context, key) if key else diagnostic
+
+
+def _format_artifact_note(context, artifacts: dict[str, str] | None) -> str:
     """Return a short text block that points to saved debug artifacts."""
     if not artifacts:
         return ""
 
-    lines = ["", "Debug artifacts saved:"]
+    lines = ["", tr(context, "offer_debug_saved")]
     screenshot_path = artifacts.get("screenshot")
     html_path = artifacts.get("html")
     if screenshot_path:
-        lines.append(f"Screenshot: {screenshot_path}")
+        lines.append(tr(context, "offer_debug_screenshot", path=screenshot_path))
     if html_path:
-        lines.append(f"HTML: {html_path}")
+        lines.append(tr(context, "offer_debug_html", path=html_path))
     return "\n".join(lines)
 
 
-def _format_diagnostic_note(diagnostic: str | None) -> str:
+def _format_diagnostic_note(context, diagnostic: str | None) -> str:
     """Return a short diagnostic block for no-offer results."""
     if not diagnostic:
         return ""
-    return f"\n\nDiagnosis: {diagnostic}"
+    localized = _translate_diagnostic(context, diagnostic)
+    return (
+        f"\n\n{tr(context, 'offer_diagnosis_label')}: {localized}"
+        if localized
+        else ""
+    )
+
+
+def _diagnostic_means_embedded_trial(diagnostic: str | None) -> bool:
+    """Return True when the page diagnosis indicates an eligible trial without a captured link."""
+    normalized = (diagnostic or "").lower()
+    return "embedded" in normalized and "trial" in normalized
 
 
 def _is_manual_challenge_error(exc: Exception) -> bool:
@@ -123,20 +165,47 @@ def _looks_like_proxy_error(exc: Exception) -> bool:
     return any(signal in message for signal in signals)
 
 
+def _proxy_has_auth(proxy_url: str | None) -> bool:
+    """Return True when the selected proxy carries username credentials."""
+    if not proxy_url:
+        return False
+    try:
+        return bool(parse_proxy_parts(proxy_url).get("username"))
+    except Exception:
+        return False
+
+
+def _is_proxy_policy_error(exc: Exception) -> bool:
+    """Return True when the upstream proxy provider blocks the destination by policy."""
+    message = str(exc).lower()
+    signals = (
+        "bad_endpoint",
+        "robots.txt",
+        "policy_20130",
+        "policy_20140",
+        "blocked this target",
+        "immediate residential",
+        "full access",
+        "full residential access",
+        "bright data blocked",
+    )
+    return any(signal in message for signal in signals)
+
+
 def _resolve_attempt_device(session: dict, attempt: int):
     """Return the device profile for this attempt and whether it is freshly minted."""
-    if attempt > 1 and config.REGENERATE_DEVICE_ON_RETRY:
-        device = create_device_profile()
+    route_tag = session.get("proxy") or "__direct__"
+    needs_fresh_device = attempt > 1 and config.REGENERATE_DEVICE_ON_RETRY
+    existing_device = session.get("device")
+    existing_route_tag = session.get("_device_route_tag")
+
+    if needs_fresh_device or not existing_device or existing_route_tag != route_tag:
+        device = create_device_profile(network_identity=session.get("network_identity"))
         session["device"] = device
+        session["_device_route_tag"] = route_tag
         return device, True
 
-    device = session.get("device")
-    if not device:
-        device = create_device_profile()
-        session["device"] = device
-        return device, True
-
-    return device, False
+    return existing_device, False
 
 
 async def _safe_send_bot_message(
@@ -157,10 +226,15 @@ async def _send_proxy_identity_panel(
     chat_id: int,
     proxy_url: str | None,
     title: str,
-) -> None:
+    proxy_session_token: str | None = None,
+) -> dict[str, str] | None:
     """Probe the selected proxy and send a readable info panel."""
     try:
-        result = await asyncio.to_thread(inspect_connection, proxy_url)
+        result = await asyncio.to_thread(
+            inspect_connection,
+            proxy_url,
+            proxy_session_token,
+        )
     except Exception as exc:
         logger.warning(
             "Failed to inspect proxy identity for chat %s via %s: %s",
@@ -177,13 +251,14 @@ async def _send_proxy_identity_panel(
                 f"⚠️ Detailed proxy identity lookup failed: {exc}"
             ),
         )
-        return
+        return None
 
     await _safe_send_bot_message(
         context,
         chat_id=chat_id,
         text=format_connection_identity(result, title=title),
     )
+    return result
 
 
 async def _report_offer(
@@ -202,12 +277,7 @@ async def _report_offer(
     )
     if offer_link:
         session["offer_link"] = offer_link
-        text = (
-            "🎉 <b>Gemini Pro Offer Found!</b>\n\n"
-            "Use the link below to activate your 12-month free Gemini Pro:\n\n"
-            f"🔗 {offer_link}\n\n"
-            "You can run /get_link anytime to retrieve this link again."
-        )
+        text = tr(context, "offer_found_html", offer_link=offer_link)
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -218,23 +288,22 @@ async def _report_offer(
         except Exception:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    "🎉 Gemini Pro Offer Found!\n\n"
-                    f"🔗 {offer_link}\n\n"
-                    "You can run /get_link anytime to retrieve this link again."
-                ),
+                text=tr(context, "offer_found_plain", offer_link=offer_link),
                 reply_markup=main_menu_keyboard(context),
             )
     else:
+        message_key = (
+            "offer_embedded_trial_detected"
+            if _diagnostic_means_embedded_trial(diagnostic)
+            else "offer_not_found_now"
+        )
         await context.bot.send_message(
             chat_id=chat_id,
-            text=(
-                "😔 No active Gemini Pro offer was detected on your Google One "
-                "account at this time.\n\n"
-                "The offer may not be available for your account region or may "
-                "have already been activated. You can try again later."
-                f"{_format_diagnostic_note(diagnostic)}"
-                f"{_format_artifact_note(artifacts)}"
+            text=tr(
+                context,
+                message_key,
+                diagnostic_note=_format_diagnostic_note(context, diagnostic),
+                artifact_note=_format_artifact_note(context, artifacts),
             ),
             reply_markup=quick_actions_inline_keyboard(context),
         )
@@ -252,7 +321,7 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
     if not session.get("email") or not session.get("password"):
         await message.reply_text(
-            "⚠️ No credentials found. Run /login first.",
+            tr(context, "offer_no_credentials"),
             reply_markup=main_menu_keyboard(context),
         )
         return ConversationHandler.END
@@ -262,23 +331,21 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if elapsed < CHECK_OFFER_COOLDOWN:
         remaining = int(CHECK_OFFER_COOLDOWN - elapsed)
         mins, secs = divmod(remaining, 60)
-        await message.reply_text(f"⏳ Please wait {mins}m {secs}s before checking again.")
+        await message.reply_text(
+            tr(context, "offer_cooldown_wait", mins=mins, secs=secs)
+        )
         return ConversationHandler.END
     LAST_CHECK_TIME[chat_id] = time.time()
 
     if CHROME_SEMAPHORE.locked():
         await message.reply_text(
-            "🔄 The system is currently at maximum capacity. Please try again in a minute.",
+            tr(context, "offer_capacity_busy"),
             reply_markup=main_menu_keyboard(context),
         )
         LAST_CHECK_TIME.pop(chat_id, None)
         return ConversationHandler.END
 
-    await message.reply_text(
-        "⏳ Starting secure check...\n"
-        "Launching Pixel 10 Pro simulation and signing in.\n"
-        "This usually takes up to 60 seconds."
-    )
+    await message.reply_text(tr(context, "offer_starting_secure_check"))
 
     offer_link = None
     no_offer_artifacts: dict[str, str] | None = None
@@ -287,57 +354,100 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         async with CHROME_SEMAPHORE:
             email_str = bytes(session["email"]).decode("utf-8")
             pw_str = bytes(session["password"]).decode("utf-8")
+            proxy_session_token = ensure_proxy_session_token(
+                session,
+                seed=f"{chat_id}{int(time.time())}",
+            )
             used_proxies: set[str] = set()
             proxy_url = None
+            fast_start_visible_auth_proxy = False
             if config.PROXY_ENABLED and not session.get("proxy_disabled"):
                 proxy_url = PROXY_MANAGER.get_proxy(preferred=session.get("proxy"))
                 if proxy_url:
                     session["proxy"] = proxy_url
-                    await _send_proxy_identity_panel(
-                        context,
-                        chat_id,
-                        proxy_url,
-                        tr(context, "proxy_panel_title"),
+                    fast_start_visible_auth_proxy = bool(
+                        config.HEADLESS
+                        and config.START_VISIBLE_WITH_AUTH_PROXY
+                        and _proxy_has_auth(proxy_url)
                     )
+                    if not fast_start_visible_auth_proxy:
+                        identity = await _send_proxy_identity_panel(
+                            context,
+                            chat_id,
+                            proxy_url,
+                            tr(context, "proxy_panel_title"),
+                            proxy_session_token,
+                        )
+                        if identity:
+                            session["network_identity"] = identity
+                        else:
+                            session.pop("network_identity", None)
+                    else:
+                        logger.info(
+                            "Skipping pre-launch proxy identity lookup for chat %s so Chrome can appear sooner on authenticated proxy startup.",
+                            chat_id,
+                        )
                 else:
                     session.pop("proxy", None)
-                    await _send_proxy_identity_panel(
+                    identity = await _send_proxy_identity_panel(
                         context,
                         chat_id,
                         None,
                         tr(context, "direct_panel_title"),
+                        proxy_session_token,
                     )
+                    if identity:
+                        session["network_identity"] = identity
+                    else:
+                        session.pop("network_identity", None)
             else:
                 session.pop("proxy", None)
-                await _send_proxy_identity_panel(
+                identity = await _send_proxy_identity_panel(
                     context,
                     chat_id,
                     None,
                     tr(context, "direct_panel_title"),
+                    proxy_session_token,
                 )
+                if identity:
+                    session["network_identity"] = identity
+                else:
+                    session.pop("network_identity", None)
 
             for attempt in range(1, max_offer_attempts + 1):
                 device, fresh_device = _resolve_attempt_device(session, attempt)
                 if attempt > 1:
                     retry_device_note = (
-                        "minting a fresh Pixel 10 Pro profile and trying again."
+                        tr(context, "offer_retry_note_fresh")
                         if fresh_device
-                        else "reusing the same session device and trying again."
+                        else tr(context, "offer_retry_note_same")
                     )
                     await message.reply_text(
-                        f"🔄 Retry {attempt}/{max_offer_attempts}: {retry_device_note}"
+                        tr(
+                            context,
+                            "offer_retry_attempt",
+                            attempt=attempt,
+                            max_attempts=max_offer_attempts,
+                            note=retry_device_note,
+                        )
                     )
 
                 driver = None
                 preserve_driver = False
                 proxy_latency_ms = 0.0
                 try:
-                    if proxy_url and config.PROXY_PRECHECK_ENABLED:
+                    should_skip_precheck = bool(
+                        proxy_url
+                        and attempt == 1
+                        and fast_start_visible_auth_proxy
+                    )
+                    if proxy_url and config.PROXY_PRECHECK_ENABLED and not should_skip_precheck:
                         try:
                             probe_result = await asyncio.to_thread(
                                 probe_google_signin,
                                 proxy_url,
                                 config.PROXY_PRECHECK_TIMEOUT_SECONDS,
+                                proxy_session_token,
                             )
                             proxy_latency_ms = float(probe_result["latency_ms"])
                             logger.info(
@@ -353,7 +463,7 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                                 mask_proxy_url(proxy_url),
                                 exc,
                             )
-                            if attempt < max_offer_attempts:
+                            if attempt < max_offer_attempts and not _is_proxy_policy_error(exc):
                                 PROXY_MANAGER.mark_failed(proxy_url, "precheck_failed")
                                 used_proxies.add(proxy_url)
                                 next_proxy = PROXY_MANAGER.get_proxy(excluded=used_proxies)
@@ -363,32 +473,57 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                                     await _safe_send_bot_message(
                                         context,
                                         chat_id=chat_id,
-                                        text="⚠️ Proxy precheck failed before opening Chrome. Rotating proxy...",
+                                        text=tr(context, "offer_proxy_precheck_failed_rotate"),
                                     )
-                                    await _send_proxy_identity_panel(
+                                    identity = await _send_proxy_identity_panel(
                                         context,
                                         chat_id,
                                         proxy_url,
                                         tr(context, "proxy_rotated_title"),
+                                        proxy_session_token,
                                     )
+                                    if identity:
+                                        session["network_identity"] = identity
+                                    else:
+                                        session.pop("network_identity", None)
                                     continue
                             raise GoogleAutomationError(
-                                f"Proxy precheck failed before opening Chrome: {exc}"
+                                tr(
+                                    context,
+                                    "offer_proxy_precheck_failed_error",
+                                    error=exc,
+                                )
                             ) from exc
+                    elif should_skip_precheck:
+                        logger.info(
+                            "Skipping proxy preflight for chat %s on first authenticated-proxy visible launch.",
+                            chat_id,
+                        )
 
                     try:
+                        if (
+                            attempt == 1
+                            and config.HEADLESS
+                            and config.START_VISIBLE_WITH_AUTH_PROXY
+                            and _proxy_has_auth(proxy_url)
+                        ):
+                            await _safe_send_bot_message(
+                                context,
+                                chat_id=chat_id,
+                                text=tr(context, "offer_opening_visible_browser"),
+                            )
                         driver, status = await asyncio.to_thread(
                             start_login,
                             email_str,
                             pw_str,
                             device,
                             proxy_url=proxy_url,
+                            proxy_session_token=proxy_session_token,
                         )
                     except GoogleAutomationError as exc:
                         if config.HEADLESS and _is_manual_challenge_error(exc):
                             await message.reply_text(
-                                "🔐 Google requested manual verification.\n"
-                                "Reopening Chrome in visible mode with the same session device..."
+                                tr(context, "offer_manual_verification_reopen")
                             )
                             driver, status = await asyncio.to_thread(
                                 start_login,
@@ -397,6 +532,7 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                                 device,
                                 False,
                                 proxy_url,
+                                proxy_session_token,
                             )
                         else:
                             raise
@@ -421,15 +557,18 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                                     close_driver(driver)
                                     driver = None
                                     await message.reply_text(
-                                        "❌ Auto-generated TOTP code was rejected. "
-                                        "Please check your TOTP secret key.",
+                                        tr(context, "offer_auto_totp_rejected"),
                                         reply_markup=main_menu_keyboard(context),
                                     )
                                     return ConversationHandler.END
 
                                 await message.reply_text(
-                                    f"✅ Login successful ({attempt}/{max_offer_attempts}).\n"
-                                    "Checking Gemini Pro offer now..."
+                                    tr(
+                                        context,
+                                        "offer_login_success_checking",
+                                        attempt=attempt,
+                                        max_attempts=max_offer_attempts,
+                                    )
                                 )
                                 offer_link = await asyncio.to_thread(check_offer_with_driver, driver)
                                 if not offer_link and attempt == max_offer_attempts:
@@ -449,8 +588,7 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                                 close_driver(driver)
                                 driver = None
                                 await message.reply_text(
-                                    f"❌ Auto-TOTP error: {exc}\n"
-                                    "Please check your TOTP secret key.",
+                                    tr(context, "offer_auto_totp_error", error=exc),
                                     reply_markup=main_menu_keyboard(context),
                                 )
                                 return ConversationHandler.END
@@ -460,11 +598,7 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                             await _safe_send_bot_message(
                                 context,
                                 chat_id=chat_id,
-                                text=(
-                                    "🔐 *Two-Factor Authentication Required*\n\n"
-                                    "Please send your 6-digit authenticator code *here in Telegram only*.\n"
-                                    "Do not type that code in the Chrome window."
-                                ),
+                                text=tr(context, "offer_2fa_required"),
                                 parse_mode="Markdown",
                             )
                             return AWAIT_2FA_CODE
@@ -480,20 +614,22 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                         await _safe_send_bot_message(
                             context,
                             chat_id=chat_id,
-                            text=(
-                                "🔐 Manual verification required.\n\n"
-                                f"Google requested: {challenge_type}\n"
-                                "Complete that step in the Chrome window that just opened.\n"
-                                "After the browser leaves the Google sign-in page, send `done` here.\n"
-                                "Send /cancel to stop this check."
+                            text=tr(
+                                context,
+                                "offer_manual_required",
+                                challenge_type=challenge_type,
                             ),
                             parse_mode="Markdown",
                         )
                         return AWAIT_MANUAL_VERIFICATION
                     else:
                         await message.reply_text(
-                            f"✅ Login successful ({attempt}/{max_offer_attempts}).\n"
-                            "Checking Gemini Pro offer now..."
+                            tr(
+                                context,
+                                "offer_login_success_checking",
+                                attempt=attempt,
+                                max_attempts=max_offer_attempts,
+                            )
                         )
                         offer_link = await asyncio.to_thread(check_offer_with_driver, driver)
                         if not offer_link and attempt == max_offer_attempts:
@@ -509,7 +645,12 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                                 device.session_id,
                             )
                 except GoogleAutomationError as exc:
-                    if proxy_url and _looks_like_proxy_error(exc) and attempt < max_offer_attempts:
+                    if (
+                        proxy_url
+                        and _looks_like_proxy_error(exc)
+                        and not _is_proxy_policy_error(exc)
+                        and attempt < max_offer_attempts
+                    ):
                         PROXY_MANAGER.mark_failed(proxy_url, "automation_error")
                         used_proxies.add(proxy_url)
                         next_proxy = PROXY_MANAGER.get_proxy(excluded=used_proxies)
@@ -519,18 +660,28 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                             await _safe_send_bot_message(
                                 context,
                                 chat_id=chat_id,
-                                text="⚠️ Proxy transport issue detected. Rotating proxy...",
+                                text=tr(context, "offer_proxy_transport_rotating"),
                             )
-                            await _send_proxy_identity_panel(
+                            identity = await _send_proxy_identity_panel(
                                 context,
                                 chat_id,
                                 proxy_url,
                                 tr(context, "proxy_rotated_title"),
+                                proxy_session_token,
                             )
+                            if identity:
+                                session["network_identity"] = identity
+                            else:
+                                session.pop("network_identity", None)
                             continue
                     raise
                 except Exception as exc:
-                    if proxy_url and _looks_like_proxy_error(exc) and attempt < max_offer_attempts:
+                    if (
+                        proxy_url
+                        and _looks_like_proxy_error(exc)
+                        and not _is_proxy_policy_error(exc)
+                        and attempt < max_offer_attempts
+                    ):
                         PROXY_MANAGER.mark_failed(proxy_url, "runtime_error")
                         used_proxies.add(proxy_url)
                         next_proxy = PROXY_MANAGER.get_proxy(excluded=used_proxies)
@@ -540,14 +691,19 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                             await _safe_send_bot_message(
                                 context,
                                 chat_id=chat_id,
-                                text="⚠️ Runtime network issue detected. Rotating proxy...",
+                                text=tr(context, "offer_runtime_network_rotating"),
                             )
-                            await _send_proxy_identity_panel(
+                            identity = await _send_proxy_identity_panel(
                                 context,
                                 chat_id,
                                 proxy_url,
                                 tr(context, "proxy_rotated_title"),
+                                proxy_session_token,
                             )
+                            if identity:
+                                session["network_identity"] = identity
+                            else:
+                                session.pop("network_identity", None)
                             continue
                     raise
                 finally:
@@ -573,24 +729,29 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
                 if attempt < max_offer_attempts:
                     delay = random.randint(15, 30)
                     await message.reply_text(
-                        f"⏳ Offer not found yet. Retrying in {delay} seconds..."
+                        tr(context, "offer_not_found_retrying", delay=delay)
                     )
                     await asyncio.sleep(delay)
                     next_retry_device = (
-                        "a fresh Pixel 10 Pro profile"
+                        tr(context, "offer_retry_device_fresh")
                         if config.REGENERATE_DEVICE_ON_RETRY
-                        else "the same session device"
+                        else tr(context, "offer_retry_device_same")
                     )
                     await message.reply_text(
-                        f"🔄 Starting retry {attempt + 1}/{max_offer_attempts}: "
-                        f"preparing {next_retry_device} and signing in again."
+                        tr(
+                            context,
+                            "offer_starting_retry",
+                            next_attempt=attempt + 1,
+                            max_attempts=max_offer_attempts,
+                            device_note=next_retry_device,
+                        )
                     )
 
     except GoogleAutomationError as exc:
         await _safe_send_bot_message(
             context,
             chat_id=chat_id,
-            text=f"❌ <b>Automation Error:</b> {exc}",
+            text=tr(context, "offer_automation_error", error=exc),
             parse_mode="HTML",
             reply_markup=main_menu_keyboard(context),
         )
@@ -600,7 +761,7 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await _safe_send_bot_message(
             context,
             chat_id=chat_id,
-            text=f"❌ An unexpected error occurred: {exc}",
+            text=tr(context, "offer_unexpected_error", error=exc),
         )
         return ConversationHandler.END
     finally:
@@ -613,15 +774,12 @@ async def check_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await _safe_send_bot_message(
             context,
             chat_id=chat_id,
-            text=(
-                f"❌ No Gemini Pro offer found after {max_offer_attempts} attempts.\n\n"
-                "Possible reasons:\n"
-                "• Your account region is not eligible\n"
-                "• An active Gemini subscription already exists\n"
-                "• Family group eligibility has already been used\n"
-                "• New-account risk controls are in effect"
-                f"{_format_diagnostic_note(no_offer_diagnostic)}"
-                f"{_format_artifact_note(no_offer_artifacts)}"
+            text=tr(
+                context,
+                "offer_not_found_after_attempts",
+                attempts=max_offer_attempts,
+                diagnostic_note=_format_diagnostic_note(context, no_offer_diagnostic),
+                artifact_note=_format_artifact_note(context, no_offer_artifacts),
             ),
             reply_markup=quick_actions_inline_keyboard(context),
         )
@@ -651,7 +809,7 @@ async def handle_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_send_bot_message(
             context,
             chat_id=chat_id,
-            text="⚠️ Session expired. Please run /check\\_offer again.",
+            text=tr(context, "offer_session_expired"),
             reply_markup=main_menu_keyboard(context),
         )
         return ConversationHandler.END
@@ -662,10 +820,7 @@ async def handle_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_send_bot_message(
             context,
             chat_id=chat_id,
-            text=(
-                "⚠️ The Chrome verification session has already closed or crashed.\n"
-                "Please run /check\\_offer again."
-            ),
+            text=tr(context, "offer_verification_session_closed"),
             reply_markup=main_menu_keyboard(context),
         )
         return ConversationHandler.END
@@ -674,13 +829,17 @@ async def handle_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _safe_send_bot_message(
             context,
             chat_id=chat_id,
-            text="⚠️ Invalid code. Please enter a 6-digit number.",
+            text=tr(context, "offer_invalid_code"),
             reply_markup=main_menu_keyboard(context),
         )
         session["_driver"] = driver
         return AWAIT_2FA_CODE
 
-    await _safe_send_bot_message(context, chat_id=chat_id, text="🔄 Verifying code…")
+    await _safe_send_bot_message(
+        context,
+        chat_id=chat_id,
+        text=tr(context, "offer_verifying_code"),
+    )
 
     try:
         async with CHROME_SEMAPHORE:
@@ -692,11 +851,7 @@ async def handle_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await _safe_send_bot_message(
                     context,
                     chat_id=chat_id,
-                    text=(
-                        "❌ Code rejected or expired.\n"
-                        "Please send a fresh 6-digit authenticator code.\n"
-                        "Send /cancel to stop this check."
-                    ),
+                    text=tr(context, "offer_code_rejected"),
                     reply_markup=main_menu_keyboard(context),
                 )
                 return AWAIT_2FA_CODE
@@ -720,10 +875,9 @@ async def handle_2fa_code(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.exception("Error in 2FA for chat %s", chat_id)
         close_driver(driver)
         error_text = (
-            "⚠️ The Chrome verification session has already closed or crashed.\n"
-            "Please run /check\\_offer again."
+            tr(context, "offer_verification_session_closed")
             if _is_dead_driver_error(exc)
-            else f"❌ Error: {exc}"
+            else tr(context, "offer_generic_error", error=exc)
         )
         await _safe_send_bot_message(context, chat_id=chat_id, text=error_text)
         return ConversationHandler.END
@@ -769,7 +923,7 @@ async def handle_manual_verification(
         await _safe_send_bot_message(
             context,
             chat_id=chat_id,
-            text="⚠️ Session expired. Please run /check\\_offer again.",
+            text=tr(context, "offer_session_expired"),
             reply_markup=main_menu_keyboard(context),
         )
         return ConversationHandler.END
@@ -780,10 +934,7 @@ async def handle_manual_verification(
         await _safe_send_bot_message(
             context,
             chat_id=chat_id,
-            text=(
-                "⚠️ The Chrome verification window has already closed or crashed.\n"
-                "Please run /check\\_offer again."
-            ),
+            text=tr(context, "offer_verification_window_closed"),
             reply_markup=main_menu_keyboard(context),
         )
         return ConversationHandler.END
@@ -791,7 +942,7 @@ async def handle_manual_verification(
     await _safe_send_bot_message(
         context,
         chat_id=chat_id,
-        text="🔄 Checking the Chrome window…",
+        text=tr(context, "offer_checking_chrome_window"),
     )
 
     try:
@@ -802,12 +953,7 @@ async def handle_manual_verification(
             await _safe_send_bot_message(
                 context,
                 chat_id=chat_id,
-                text=(
-                    "🔐 *Two-Factor Authentication Required*\n\n"
-                    "Google has moved to the authenticator-code step.\n"
-                    "Please send your 6-digit code *here in Telegram only*.\n"
-                    "Do not type that code in the Chrome window."
-                ),
+                text=tr(context, "offer_2fa_required_after_manual"),
                 parse_mode="Markdown",
                 reply_markup=main_menu_keyboard(context),
             )
@@ -819,11 +965,10 @@ async def handle_manual_verification(
             await _safe_send_bot_message(
                 context,
                 chat_id=chat_id,
-                text=(
-                    "⏳ Google is still waiting for verification in Chrome.\n"
-                    f"Pending step: {challenge_type}\n"
-                    "Finish it there first, then send `done` again.\n"
-                    "Send /cancel to stop this check."
+                text=tr(
+                    context,
+                    "offer_google_waiting_verification",
+                    challenge_type=challenge_type,
                 ),
                 parse_mode="Markdown",
                 reply_markup=main_menu_keyboard(context),
@@ -833,7 +978,7 @@ async def handle_manual_verification(
         await _safe_send_bot_message(
             context,
             chat_id=chat_id,
-            text="✅ Verification completed. Checking Gemini Pro offer now...",
+            text=tr(context, "offer_verification_completed_checking"),
         )
         try:
             offer_link = await asyncio.to_thread(check_offer_with_driver, driver)
@@ -854,10 +999,9 @@ async def handle_manual_verification(
         logger.exception("Error in manual verification for chat %s", chat_id)
         close_driver(driver)
         error_text = (
-            "⚠️ The Chrome verification window has already closed or crashed.\n"
-            "Please run /check\\_offer again."
+            tr(context, "offer_verification_window_closed")
             if _is_dead_driver_error(exc)
-            else f"❌ Error: {exc}"
+            else tr(context, "offer_generic_error", error=exc)
         )
         await _safe_send_bot_message(context, chat_id=chat_id, text=error_text)
         return ConversationHandler.END
@@ -888,7 +1032,7 @@ async def cancel_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     _clear_pending_verification(session)
     close_driver(driver)
     await update.message.reply_text(
-        "❌ Verification cancelled.",
+        tr(context, "offer_verification_cancelled"),
         reply_markup=main_menu_keyboard(context),
     )
     return ConversationHandler.END
@@ -904,7 +1048,7 @@ async def offer_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         close_driver(driver)
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⏰ Verification timed out. Please run /check_offer again.",
+            text=tr(context, "offer_verification_timed_out"),
             reply_markup=main_menu_keyboard(context),
         )
     return ConversationHandler.END
