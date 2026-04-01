@@ -147,6 +147,51 @@ jobs:
                   for prefix in prefixes
               )
 
+          def is_pixel_related_file(path):
+              lowered = path.lower()
+              exact_matches = {
+                  "config.py",
+                  "main.py",
+                  "services/device_simulator.py",
+                  "services/google_automation.py",
+                  "services/proxy_forwarder.py",
+                  "services/setup_diagnostics.py",
+                  "services/wit_ai_solver.py",
+                  "handlers/auth_handlers.py",
+                  "handlers/offer_handlers.py",
+                  "handlers/session_handlers.py",
+                  "handlers/ui.py",
+                  ".env.example",
+                  "readme.md",
+                  "changelog.md",
+              }
+              prefix_matches = (
+                  "assets/telegram/",
+                  "services/google_",
+                  "services/device_",
+                  "services/proxy_",
+                  "services/setup_",
+                  "services/wit_",
+                  "handlers/auth_",
+                  "handlers/offer_",
+                  "handlers/session_",
+                  "handlers/ui",
+              )
+              keyword_matches = (
+                  "pixel",
+                  "google_automation",
+                  "device_simulator",
+                  "proxy_forwarder",
+                  "wit_ai",
+              )
+              if lowered in exact_matches:
+                  return True
+              if any(lowered.startswith(prefix) for prefix in prefix_matches):
+                  return True
+              return any(keyword in lowered for keyword in keyword_matches)
+
+          pixel_related_files = [path for path in changed_files if is_pixel_related_file(path)]
+
           product_highlights = []
           if touches("services/setup_diagnostics.py", "main.py", "handlers/session_handlers.py", "handlers/ui.py"):
               product_highlights.append("🩺 Add /doctor setup self-check and clearer first-run diagnostics for new users.")
@@ -166,6 +211,9 @@ jobs:
               if item not in deduped_highlights:
                   deduped_highlights.append(item)
           product_highlights = deduped_highlights[:5]
+
+          if pixel_related_files:
+              badges.append("<code>📱 PIXEL UPDATE</code>")
 
           release_mode = "major" if (
               len(product_highlights) >= 3
@@ -210,6 +258,16 @@ jobs:
           if len(changed_files) > 6:
               file_lines.append(f"➕ <i>{len(changed_files) - 6} more files changed</i>")
 
+          pixel_file_lines = []
+          for path in pixel_related_files[:5]:
+              pixel_file_lines.append(f"┣ 📱 <code>{html.escape(path)}</code>")
+          if pixel_related_files:
+              pixel_file_lines[-1] = pixel_file_lines[-1].replace("┣", "┗", 1)
+          else:
+              pixel_file_lines.append("┗ <i>No Pixel-related files were detected in this push.</i>")
+          if len(pixel_related_files) > 5:
+              pixel_file_lines.append(f"➕ <i>{len(pixel_related_files) - 5} more Pixel-related files changed</i>")
+
           detail_lines = (
               [f"┣ ✦ {html.escape(line)}" for line in details[:-1]]
               + ([f"┗ ✦ {html.escape(details[-1])}"] if details else [])
@@ -247,6 +305,10 @@ jobs:
                   "┏ <b>Files Changed</b>",
                   *file_lines,
                   *( [f"📊 <i>{html.escape(shortstat)}</i>"] if shortstat else [f"📊 <i>{len(changed_files)} file(s) changed</i>"] ),
+                  "",
+                  "┏ <b>Pixel Files Updated</b>",
+                  *pixel_file_lines,
+                  f"📱 <i>{len(pixel_related_files)} Pixel-related file(s) detected</i>",
                   "",
                   "┏ <b>Quick Links</b>",
                   f"┣ 🔗 <a href=\"{html.escape(os.environ.get('COMMIT_URL', '-'))}\">Open Commit</a>",
